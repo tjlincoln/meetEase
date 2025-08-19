@@ -1,0 +1,15 @@
+streamlit
+flask
+openai
+langchain
+langchain-openai
+faiss-cpu
+tiktoken
+whisper
+moviepy
+pytesseract
+pillow
+python-docx
+pymupdf
+mysql-connector-python
+numpy
