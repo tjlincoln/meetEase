@@ -30,4 +30,6 @@ aiohttp
 requests
 moviepy
 imageio[ffmpeg]
+psycopg2
+
 
