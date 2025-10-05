@@ -32,6 +32,7 @@ moviepy
 imageio[ffmpeg]
 psycopg2-binary
 python-dotenv
-pyaudioop
+
+
 
 
