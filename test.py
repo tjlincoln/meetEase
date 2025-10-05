@@ -1,3 +1,5 @@
+
+
 # MeetEase — FAST version (optimized)
 # -------------------------------------------------------------
 # Key improvements:
@@ -23,18 +25,33 @@ load_dotenv()
 
 # ------------------ ENV (as requested) ------------------
 # Supabase PostgreSQL Configuration
-SUPABASE_HOST     = os.getenv("SUPABASE_HOST", "db.mvnvxfuiyggatlakgrbr.supabase.co")
-SUPABASE_PORT     = os.getenv("SUPABASE_PORT", "5432")
-SUPABASE_USER     = os.getenv("SUPABASE_USER", "postgres")
-SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD", "MeetEase@4545")
-SUPABASE_DB       = os.getenv("SUPABASE_DATABASE", "postgres")
+# Try to load from Streamlit secrets first (for cloud deployment), then fall back to .env
+try:
+    import streamlit as st
+    SUPABASE_URL      = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+    SUPABASE_KEY      = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+    SUPABASE_HOST     = st.secrets.get("SUPABASE_HOST", os.getenv("SUPABASE_HOST", "db.mvnvxfuiyggatlakgrbr.supabase.co"))
+    SUPABASE_PORT     = st.secrets.get("SUPABASE_PORT", os.getenv("SUPABASE_PORT", "5432"))
+    SUPABASE_USER     = st.secrets.get("SUPABASE_USER", os.getenv("SUPABASE_USER", "postgres"))
+    SUPABASE_PASSWORD = st.secrets.get("SUPABASE_PASSWORD", os.getenv("SUPABASE_PASSWORD", "MeetEase@4545"))
+    SUPABASE_DB       = st.secrets.get("SUPABASE_DATABASE", os.getenv("SUPABASE_DATABASE", "postgres"))
+    OPENAI_API_KEY    = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
+except:
+    # Fallback to environment variables only
+    SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
+    SUPABASE_KEY      = os.getenv("SUPABASE_KEY", "")
+    SUPABASE_HOST     = os.getenv("SUPABASE_HOST", "db.mvnvxfuiyggatlakgrbr.supabase.co")
+    SUPABASE_PORT     = os.getenv("SUPABASE_PORT", "5432")
+    SUPABASE_USER     = os.getenv("SUPABASE_USER", "postgres")
+    SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD", "MeetEase@4545")
+    SUPABASE_DB       = os.getenv("SUPABASE_DATABASE", "postgres")
+    OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "").strip()
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
-# chalse k env ma nakhvu pdse?
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
 
@@ -82,15 +99,26 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 def db_conn():
-    return psycopg2.connect(
-        host=SUPABASE_HOST, 
-        port=SUPABASE_PORT,
-        user=SUPABASE_USER, 
-        password=SUPABASE_PASSWORD,
-        database=SUPABASE_DB,
-        sslmode='require',  # Supabase requires SSL
-        cursor_factory=RealDictCursor
-    )
+    """Create database connection with proper error handling"""
+    try:
+        conn = psycopg2.connect(
+            host=SUPABASE_HOST, 
+            port=SUPABASE_PORT,
+            user=SUPABASE_USER, 
+            password=SUPABASE_PASSWORD,
+            database=SUPABASE_DB,
+            sslmode='require',  # Supabase requires SSL
+            cursor_factory=RealDictCursor,
+            connect_timeout=10  # Add timeout
+        )
+        return conn
+    except psycopg2.Error as e:
+        st.error(f"Database connection failed: {str(e)}")
+        st.info("Please check your database credentials in Streamlit Cloud secrets.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Unexpected error connecting to database: {str(e)}")
+        st.stop()
 
 # ---------------- OCR / FILES ------------
 from PIL import Image
@@ -682,141 +710,3 @@ with tab_agenda:
             st.markdown(f'<div class="card">{agenda_md}</div>', unsafe_allow_html=True)
             st.download_button("Download Agenda (.md)", data=agenda_md.encode("utf-8"),
                                file_name="agenda.md", mime="text/markdown", use_container_width=True)
-
-# -------- TRACKING TAB --------
-with tab_track:
-    st.markdown("### 🎥 Meeting Tracking & Agenda Resolution")
-    if not (app.meeting_id and app.discussion_points):
-        st.warning("No agenda points available. Please finish **Pre-Meeting**.")
-    else:
-        v = st.file_uploader("Upload meeting video or audio", type=["mp4", "mov", "avi", "wav", "mp3", "m4a"])
-        trans_bar = st.progress(0.0, text="Waiting for media...")
-        eta_txt = st.empty()
-
-        if v:
-            if v.type.startswith("video"):
-                st.video(v)
-            else:
-                st.audio(v)
-
-            if st.button("Transcribe & Analyze", type="primary", use_container_width=True):
-                suffix = os.path.splitext(v.name)[1].lower()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_v:
-                    tmp_v.write(v.getbuffer())
-                    media_path = tmp_v.name
-
-                # Extract audio fast
-                audio_path = extract_audio_to_wav(media_path)
-                safe_unlink(media_path)
-
-                def _progress_cb(p: float, eta: float):
-                    trans_bar.progress(p, text=f"Transcribing {int(p*100)}%")
-                    eta_txt.markdown(f"<div class='small'>ETA ~ {int(eta)}s</div>", unsafe_allow_html=True)
-
-                try:
-                    transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
-                    transcript = dedupe_lines(transcript)
-                    app.last_transcript = transcript
-                    with open(audio_path, "rb") as f:
-                        audio_hash = sha256_bytes(f.read())
-                    transcript_upsert(app.meeting_id, audio_hash, transcript)
-                    trans_bar.progress(1.0, text="Transcription complete")
-                finally:
-                    safe_unlink(audio_path)
-
-                resolved, unresolved = analyze_agenda_resolution(app.discussion_points, app.last_transcript or "")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("#### ✅ Resolved")
-                    if resolved: st.success("\n".join(f"• {r}" for r in resolved))
-                    else: st.write("—")
-                with c2:
-                    st.markdown("#### ⏳ Unresolved")
-                    if unresolved: st.warning("\n".join(f"• {u}" for u in unresolved))
-                    else: st.write("—")
-
-                with st.expander("Show Transcript"):
-                    st.write(app.last_transcript or "")
-
-# -------- SUMMARY TAB --------
-with tab_summary:
-    st.markdown("### 📝 Post-Meeting Summary")
-    if not (app.meeting_id and app.faiss_store):
-        st.warning("Please complete **Pre-Meeting** so RAG context is available.")
-    else:
-        v2 = st.file_uploader("Upload meeting media (optional)", type=["mp4","mov","avi","wav","mp3","m4a"], key="post_vid")
-        query = st.text_input("Focus query",
-                              value="Key discussion topics, decisions made, action items with owners",
-                              help="What do you want the summary to emphasize?")
-
-        if st.button("Generate Summary", type="primary", use_container_width=True):
-            transcript = app.last_transcript or ""
-            if v2 and not transcript:
-                suffix = os.path.splitext(v2.name)[1].lower()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_v:
-                    tmp_v.write(v2.getbuffer()); media_path = tmp_v.name
-                audio_path = extract_audio_to_wav(media_path)
-                safe_unlink(media_path)
-                trans_bar = st.progress(0.0, text="Transcribing...")
-                eta_txt = st.empty()
-                def _progress_cb(p: float, eta: float):
-                    trans_bar.progress(p, text=f"Transcribing {int(p*100)}%")
-                    eta_txt.markdown(f"<div class='small'>ETA ~ {int(eta)}s</div>", unsafe_allow_html=True)
-                try:
-                    transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
-                    transcript = dedupe_lines(transcript)
-                    app.last_transcript = transcript
-                    with open(audio_path, "rb") as f:
-                        audio_hash = sha256_bytes(f.read())
-                    transcript_upsert(app.meeting_id, audio_hash, transcript)
-                finally:
-                    safe_unlink(audio_path)
-
-            if not transcript.strip():
-                st.error("No transcript available. Upload media in **Tracking** or here.")
-            else:
-                if not app.last_doc_text:
-                    conn = db_conn()
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT text FROM documents WHERE meeting_id=%s ORDER BY created_at DESC LIMIT 1", (app.meeting_id,))
-                        row = cur.fetchone()
-                    conn.close()
-                    app.last_doc_text = (row or {}).get("text") or ""
-                app.chunks = build_chunks(app.last_doc_text)
-
-                q = (", ".join(app.discussion_points or []) + " " + query).strip()
-                ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
-                llm = maybe_llm(max_tokens=450, temperature=TEMPERATURE)
-                chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm) if llm else None
-                obj = run_json(chain,
-                               ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
-                               transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
-                               query=query)
-
-                summary_insert(app.meeting_id, query, obj)
-
-                st.markdown("### Summary (JSON)")
-                st.code(json.dumps(obj, indent=2))
-                st.download_button("Download Summary (JSON)",
-                                   data=json.dumps(obj, indent=2).encode("utf-8"),
-                                   file_name="post_meeting_summary.json",
-                                   mime="application/json",
-                                   use_container_width=True)
-
-# -------- METRICS & EXPORT TAB ----------
-
-
-# ======= FINAL NOTE =======
-if not OPENAI_API_KEY:
-    st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
-
-# === DB INDEX SUGGESTIONS (run once in your DB) ===
-# CREATE INDEX idx_meetings_title_date ON meetings (title, meeting_date);
-# CREATE UNIQUE INDEX idx_documents_meeting_hash ON documents (meeting_id, hash_key);
-# CREATE INDEX idx_doc_chunks_doc ON doc_chunks (document_id, chunk_index);
-# CREATE INDEX idx_indices_doc ON indices (document_id);
-# CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
-# CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
-
-
