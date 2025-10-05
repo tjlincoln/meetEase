@@ -23,15 +23,15 @@ import os
 import psycopg2
 import psycopg2.extras
 import streamlit as st
-
-# postgres_conn.py (paste into your Streamlit app)
+# postgres_pool.py (paste into your Streamlit app)
 import os
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool
 import streamlit as st
+from contextlib import contextmanager
 
-# Prefer st.secrets (Streamlit Cloud). Fall back to env vars for local dev.
+# Prefer st.secrets but fall back to env vars
 if "postgres" in st.secrets:
     PGHOST     = st.secrets["postgres"]["host"]
     PGPORT     = int(st.secrets["postgres"]["port"])
@@ -39,14 +39,12 @@ if "postgres" in st.secrets:
     PGUSER     = st.secrets["postgres"]["user"]
     PGPASSWORD = st.secrets["postgres"]["password"]
 else:
-    PGHOST     = os.getenv("PGHOST", "db.MeetEase.supabase.co")
+    PGHOST     = os.getenv("PGHOST", "db.mhgbdxadbvrmeffljnry.supabase.co")
     PGPORT     = int(os.getenv("PGPORT", "6543"))
     PGDATABASE = os.getenv("PGDATABASE", "postgres")
     PGUSER     = os.getenv("PGUSER", "postgres")
     PGPASSWORD = os.getenv("PGPASSWORD", "")
 
-# Create a persistent connection pool cached by Streamlit.
-# st.cache_resource ensures pool is created once per process.
 @st.cache_resource
 def get_pg_pool(minconn: int = 1, maxconn: int = 5):
     dsn = {
@@ -61,8 +59,6 @@ def get_pg_pool(minconn: int = 1, maxconn: int = 5):
     conn_str = " ".join(f"{k}={v}" for k, v in dsn.items())
     return psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, conn_str)
 
-# Helper context manager to get a cursor (RealDictCursor returns dict rows)
-from contextlib import contextmanager
 @contextmanager
 def pg_cursor():
     pool = get_pg_pool()
@@ -83,12 +79,12 @@ def pg_cursor():
         if conn:
             pool.putconn(conn)
 
-# QUICK CONNECTION TEST (show once, useful during development)
+# Quick test (only during development)
 try:
     with pg_cursor() as cur:
-        cur.execute("SELECT current_database() as db, version() as ver")
-        r = cur.fetchone()
-        st.success(f"Connected to Postgres DB: {r['db']} — {r['ver'].splitlines()[0]}")
+        cur.execute("SELECT current_database() AS db, NOW() AS ts")
+        row = cur.fetchone()
+        st.success(f"Connected to Postgres: {row['db']} (time: {row['ts']})")
 except Exception as e:
     st.error(f"DB connection failed: {e}")
     st.stop()
@@ -848,6 +844,7 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
 
 
