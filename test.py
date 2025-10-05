@@ -1,5 +1,6 @@
 # =======================
-# ALL IMPORTS (TOP ONLY)
+# MeetEase — NO-DB EDITION
+# Fully local (session + JSON files), no MySQL/Postgres required
 # =======================
 from __future__ import annotations
 
@@ -17,14 +18,13 @@ import tempfile
 import subprocess
 import shutil
 import warnings
+import pickle
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
 # third-party
 import streamlit as st                       # UI
-import psycopg2                              # Supabase/Postgres driver
-import psycopg2.extras as pg_extras          # RealDictCursor
 
 from PIL import Image                        # OCR helpers
 import numpy as np
@@ -64,18 +64,12 @@ CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
 
-# Supabase / Postgres envs (set these in your environment/dashboard)
-PG_HOST     = os.getenv("PGHOST",     "db.mvnvxfuiyggatlakgrbr.supabase.co")
-PG_PORT     = int(os.getenv("PGPORT", "5432"))
-PG_DB       = os.getenv("PGDATABASE", "postgres")
-PG_USER     = os.getenv("PGUSER",     "postgres")
-PG_PASSWORD = os.getenv("PGPASSWORD", "MeetEase@4545")
-PG_SSLMODE  = os.getenv("PGSSLMODE",  "require")
+LOCAL_DB_PATH = os.path.join(CACHE_DIR, "local_store.json")
 
 # =======================
 # STREAMLIT UI SHELL
 # =======================
-st.set_page_config(page_title="MeetEase — Meeting Management", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="MeetEase — Meeting Management (No-DB)", page_icon="🎯", layout="wide")
 st.markdown("""
 <style>
 .main .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
@@ -93,30 +87,40 @@ textarea {border-radius: 10px !important;}
 .codebox {font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
 </style>
 """, unsafe_allow_html=True)
-st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance.</div>', unsafe_allow_html=True)
+st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management (No-DB)</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI — fully local, no database.</div>', unsafe_allow_html=True)
 st.write("")
 
 # =======================
-# DB (Supabase/Postgres)
+# LOCAL JSON “STORE”
 # =======================
-def db_conn():
-    conn = psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DB,
-        user=PG_USER,
-        password=PG_PASSWORD,
-        sslmode=PG_SSLMODE,
-    )
-    conn.autocommit = True
-    return conn
+def _load_store() -> Dict:
+    if not os.path.isfile(LOCAL_DB_PATH):
+        return {
+            "meetings": [],          # {id, title, meeting_date, created_at}
+            "documents": [],         # {id, meeting_id, name, mime, hash_key, text, created_at}
+            "doc_chunks": [],        # {document_id, chunk_index, text, hash_key}
+            "agendas": [],           # {meeting_id, agenda_text, created_at}
+            "transcripts": [],       # {meeting_id, audio_hash, transcript, created_at}
+            "summaries": []          # {meeting_id, query_text, summary_text(json), created_at}
+        }
+    with open(LOCAL_DB_PATH, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {
+                "meetings": [], "documents": [], "doc_chunks": [],
+                "agendas": [], "transcripts": [], "summaries": []
+            }
 
-# =======================
-# OCR / FILE EXTRACTORS
-# =======================
-if TESSERACT_PATH_WIN:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH_WIN
+def _save_store(store: Dict):
+    tmp = LOCAL_DB_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, LOCAL_DB_PATH)
+
+def _next_id(items: List[Dict]) -> int:
+    return (max((x.get("id", 0) for x in items), default=0) + 1)
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -125,6 +129,9 @@ def settings_hash(d: Dict) -> str:
     s = json.dumps(d, sort_keys=True)
     return hashlib.sha256(s.encode()).hexdigest()
 
+# =======================
+# TOKEN / EMBEDDINGS / SPLITTER
+# =======================
 @st.cache_resource(show_spinner=False)
 def token_encoder_cached():
     import tiktoken
@@ -150,6 +157,12 @@ def build_chunks(text: str) -> List[str]:
     splitter = get_splitter()
     chunks = splitter.split_text(text or "")
     return chunks if chunks else [text or ""]
+
+# =======================
+# OCR / FILE EXTRACTORS
+# =======================
+if TESSERACT_PATH_WIN:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH_WIN
 
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -307,123 +320,113 @@ def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
     return dedupe_lines(final)
 
 # =======================
-# DB HELPERS (Supabase)
+# LOCAL STORE HELPERS
 # =======================
-def meeting_get_or_create(title: str, mdate: date) -> int:
-    conn = db_conn()
-    try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            cur.execute("SELECT id FROM meetings WHERE title=%s AND meeting_date=%s", (title, mdate))
-            row = cur.fetchone()
-            if row: return row["id"]
-            cur.execute("INSERT INTO meetings (title, meeting_date) VALUES (%s, %s) RETURNING id", (title, mdate))
-            return cur.fetchone()["id"]
-    finally:
-        conn.close()
+def meeting_get_or_create_local(title: str, mdate: date) -> int:
+    store = _load_store()
+    for m in store["meetings"]:
+        if m["title"] == title and m["meeting_date"] == str(mdate):
+            return m["id"]
+    mid = _next_id(store["meetings"])
+    store["meetings"].append({
+        "id": mid,
+        "title": title,
+        "meeting_date": str(mdate),
+        "created_at": datetime.utcnow().isoformat()
+    })
+    _save_store(store)
+    return mid
 
-def document_get_or_create(meeting_id: int, name: str, mime: str, content: bytes) -> Tuple[int, str]:
+def document_get_or_create_local(meeting_id: int, name: str, mime: str, content: bytes) -> Tuple[int, str]:
     h = sha256_bytes(content)
-    conn = db_conn()
-    try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            cur.execute("SELECT id FROM documents WHERE hash_key=%s AND meeting_id=%s", (h, meeting_id))
-            r = cur.fetchone()
-            if r: return r["id"], h
-            cur.execute(
-                "INSERT INTO documents (meeting_id, name, mime, hash_key) VALUES (%s,%s,%s,%s) RETURNING id",
-                (meeting_id, name, mime, h)
-            )
-            return cur.fetchone()["id"], h
-    finally:
-        conn.close()
+    store = _load_store()
+    for d in store["documents"]:
+        if d["hash_key"] == h and d["meeting_id"] == meeting_id:
+            return d["id"], h
+    did = _next_id(store["documents"])
+    store["documents"].append({
+        "id": did,
+        "meeting_id": meeting_id,
+        "name": name,
+        "mime": mime,
+        "hash_key": h,
+        "text": "",
+        "created_at": datetime.utcnow().isoformat()
+    })
+    _save_store(store)
+    return did, h
 
-def document_update_text(doc_id: int, text: str):
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE documents SET text=%s WHERE id=%s", (text, doc_id))
-    finally:
-        conn.close()
+def document_update_text_local(doc_id: int, text: str):
+    store = _load_store()
+    for d in store["documents"]:
+        if d["id"] == doc_id:
+            d["text"] = text
+            break
+    _save_store(store)
 
-def chunks_upsert(doc_id: int, chunks: List[str]):
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM doc_chunks WHERE document_id=%s", (doc_id,))
-            for i, c in enumerate(chunks):
-                hk = sha256_bytes(c.encode("utf-8"))
-                cur.execute(
-                    "INSERT INTO doc_chunks (document_id, chunk_index, text, hash_key) VALUES (%s,%s,%s,%s)",
-                    (doc_id, i, c, hk)
-                )
-    finally:
-        conn.close()
+def chunks_upsert_local(doc_id: int, chunks: List[str]):
+    store = _load_store()
+    store["doc_chunks"] = [c for c in store["doc_chunks"] if c["document_id"] != doc_id]
+    for i, c in enumerate(chunks):
+        hk = sha256_bytes(c.encode("utf-8"))
+        store["doc_chunks"].append({
+            "document_id": doc_id,
+            "chunk_index": i,
+            "text": c,
+            "hash_key": hk
+        })
+    _save_store(store)
 
-def indices_get(doc_id: int):
-    conn = db_conn()
-    try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM indices WHERE document_id=%s", (doc_id,))
-            return cur.fetchone()
-    finally:
-        conn.close()
+def agenda_insert_local(meeting_id: int, agenda_text: str):
+    store = _load_store()
+    store["agendas"].append({
+        "meeting_id": meeting_id,
+        "agenda_text": agenda_text,
+        "created_at": datetime.utcnow().isoformat()
+    })
+    _save_store(store)
 
-def indices_upsert(doc_id: int, doc_hash: str, bm25_path: str, embed_index_path: str, embed_model: str):
-    conn = db_conn()
-    try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            cur.execute("SELECT id FROM indices WHERE document_id=%s", (doc_id,))
-            row = cur.fetchone()
-            if row:
-                cur.execute(
-                    "UPDATE indices SET doc_hash=%s, bm25_path=%s, embed_index_path=%s, embed_model=%s WHERE id=%s",
-                    (doc_hash, bm25_path, embed_index_path, embed_model, row["id"])
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO indices (document_id, doc_hash, bm25_path, embed_index_path, embed_model) VALUES (%s,%s,%s,%s,%s)",
-                    (doc_id, doc_hash, bm25_path, embed_index_path, embed_model)
-                )
-    finally:
-        conn.close()
+def transcript_upsert_local(meeting_id: int, audio_hash: str, transcript_text: str):
+    store = _load_store()
+    found = False
+    for t in store["transcripts"]:
+        if t["meeting_id"] == meeting_id and t["audio_hash"] == audio_hash:
+            t["transcript"] = transcript_text
+            found = True
+            break
+    if not found:
+        store["transcripts"].append({
+            "meeting_id": meeting_id,
+            "audio_hash": audio_hash,
+            "transcript": transcript_text,
+            "created_at": datetime.utcnow().isoformat()
+        })
+    _save_store(store)
 
-def agenda_insert(meeting_id: int, agenda_text: str):
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO agendas (meeting_id, agenda_text) VALUES (%s,%s)", (meeting_id, agenda_text))
-    finally:
-        conn.close()
+def summary_insert_local(meeting_id: int, query_text: str, summary_json: Dict):
+    store = _load_store()
+    store["summaries"].append({
+        "meeting_id": meeting_id,
+        "query_text": query_text,
+        "summary_text": summary_json,
+        "created_at": datetime.utcnow().isoformat()
+    })
+    _save_store(store)
 
-def transcript_upsert(meeting_id: int, audio_hash: str, transcript_text: str):
-    conn = db_conn()
-    try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            cur.execute("SELECT id FROM transcripts WHERE meeting_id=%s AND audio_hash=%s", (meeting_id, audio_hash))
-            r = cur.fetchone()
-            if r:
-                cur.execute("UPDATE transcripts SET transcript=%s WHERE id=%s", (transcript_text, r["id"]))
-            else:
-                cur.execute("INSERT INTO transcripts (meeting_id, audio_hash, transcript) VALUES (%s,%s,%s)",
-                            (meeting_id, audio_hash, transcript_text))
-    finally:
-        conn.close()
-
-def summary_insert(meeting_id: int, query_text: str, summary_json: Dict):
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO summaries (meeting_id, query_text, summary_text) VALUES (%s,%s,%s)",
-                        (meeting_id, query_text, json.dumps(summary_json, ensure_ascii=False)))
-    finally:
-        conn.close()
+def get_latest_document_text_local(meeting_id: int) -> str:
+    store = _load_store()
+    docs = [d for d in store["documents"] if d["meeting_id"] == meeting_id]
+    if not docs: return ""
+    # newest by created_at
+    docs.sort(key=lambda d: d.get("created_at",""), reverse=True)
+    return docs[0].get("text","") or ""
 
 # =======================
-# RAG HELPERS
+# RAG HELPERS (FAISS/BM25 on disk only)
 # =======================
-def faiss_save(store: FAISS, path_dir: str):
+def faiss_save(store_obj: FAISS, path_dir: str):
     os.makedirs(path_dir, exist_ok=True)
-    store.save_local(path_dir)
+    store_obj.save_local(path_dir)
 
 def faiss_load(path_dir: str, embeddings):
     if not os.path.isdir(path_dir): return None
@@ -452,44 +455,33 @@ def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_
     faiss_dir = os.path.join(CACHE_DIR, f"faiss_{doc_id}_{s_hash[:8]}")
     bm25_path = os.path.join(CACHE_DIR, f"bm25_{doc_id}_{s_hash[:8]}.pkl")
 
-    if os.path.isdir(faiss_dir) and os.path.isfile(bm25_path):
-        embeddings = get_embeddings_cached()
-        store = faiss_load(faiss_dir, embeddings)
-        bm25 = bm25_load(bm25_path)
-        chunks = build_chunks(full_text)
-        if store and bm25:
-            chunks_upsert(doc_id, chunks)
-            return store, bm25, chunks, faiss_dir, bm25_path
-
     embeddings = get_embeddings_cached()
     chunks = build_chunks(full_text)
-    store = FAISS.from_texts(chunks, embeddings)
-    faiss_save(store, faiss_dir)
+
+    # Try to reuse
+    store_obj = faiss_load(faiss_dir, embeddings)
+    bm25 = bm25_load(bm25_path)
+    if store_obj and bm25:
+        chunks_upsert_local(doc_id, chunks)
+        return store_obj, bm25, chunks, faiss_dir, bm25_path
+
+    # Build fresh
+    store_obj = FAISS.from_texts(chunks, embeddings)
+    faiss_save(store_obj, faiss_dir)
     bm25 = BM25Okapi([c.split() for c in chunks])
     bm25_save(bm25, bm25_path)
-    chunks_upsert(doc_id, chunks)
-    indices_upsert(doc_id, doc_hash, bm25_path, faiss_dir,
-                   ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME))
-    return store, bm25, chunks, faiss_dir, bm25_path
+    chunks_upsert_local(doc_id, chunks)
+    return store_obj, bm25, chunks, faiss_dir, bm25_path
 
-def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Optional[BM25Okapi], Optional[List[str]]]:
-    rec = indices_get(doc_id)
-    if not rec: return None, None, None
-    embeddings = get_embeddings_cached()
-    store = faiss_load(rec.get("embed_index_path",""), embeddings)
-    bm25  = bm25_load(rec.get("bm25_path","")) if rec.get("bm25_path") else None
-    return store, bm25, None
-
-def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
+def select_context(store_obj: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
     ctx = ""
-    if store:
+    if store_obj:
         try:
-            docs = store.similarity_search(query, k=k)
+            docs = store_obj.similarity_search(query, k=k)
             ctx = "\n\n".join(d.page_content for d in docs)
         except Exception:
             pass
     if (not ctx) and bm25 and chunks:
-        import numpy as np
         scores = bm25.get_scores(query.split())
         top_idx = np.argsort(scores)[-k:][::-1]
         ctx = "\n\n".join(chunks[i] for i in top_idx)
@@ -560,18 +552,15 @@ with tab_pre:
             if not up or not dpoints.strip():
                 st.warning("Please upload a document and add discussion points."); st.stop()
 
-            app.meeting_id = meeting_get_or_create(title.strip(), mdate)
+            app.meeting_id = meeting_get_or_create_local(title.strip(), mdate)
 
             raw = up.read()
-            app.document_id, app.document_hash = document_get_or_create(app.meeting_id, up.name, up.type or "", raw)
+            app.document_id, app.document_hash = document_get_or_create_local(app.meeting_id, up.name, up.type or "", raw)
 
-            # Extract or reuse text
-            conn = db_conn()
-            with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-                cur.execute("SELECT text FROM documents WHERE id=%s", (app.document_id,))
-                row = cur.fetchone()
-            conn.close()
-            text = (row or {}).get("text")
+            # Extract or reuse text from local store
+            store = _load_store()
+            doc_rec = next((d for d in store["documents"] if d["id"] == app.document_id), None)
+            text = (doc_rec or {}).get("text", "")
 
             if not text:
                 ext = (up.name.split(".")[-1] or "").lower()
@@ -589,7 +578,7 @@ with tab_pre:
                     ocr_bar.progress(1.0, text="Image OCR done")
                 else:
                     st.error("Unsupported file type."); st.stop()
-                document_update_text(app.document_id, text)
+                document_update_text_local(app.document_id, text)
             else:
                 ocr_bar.progress(1.0, text="Reusing cached text")
 
@@ -636,8 +625,8 @@ with tab_agenda:
                 agenda_md = chain.run(discussion_points="\n- " + "\n- ".join(app.discussion_points), context=in_ctx)
             else:
                 agenda_md = "## Agenda\n" + "\n".join(f"- {p}" for p in app.discussion_points)
-            agenda_insert(app.meeting_id, agenda_md)
-            st.success("Agenda generated and saved!")
+            agenda_insert_local(app.meeting_id, agenda_md)
+            st.success("Agenda generated and saved locally!")
             st.markdown("### Generated Agenda")
             st.markdown(f'<div class="card">{agenda_md}</div>', unsafe_allow_html=True)
             st.download_button("Download Agenda (.md)", data=agenda_md.encode("utf-8"),
@@ -678,7 +667,7 @@ with tab_track:
                     app.last_transcript = transcript
                     with open(audio_path, "rb") as f:
                         audio_hash = sha256_bytes(f.read())
-                    transcript_upsert(app.meeting_id, audio_hash, transcript)
+                    transcript_upsert_local(app.meeting_id, audio_hash, transcript)
                     trans_bar.progress(1.0, text="Transcription complete")
                 finally:
                     safe_unlink(audio_path)
@@ -728,20 +717,15 @@ with tab_summary:
                     app.last_transcript = transcript
                     with open(audio_path, "rb") as f:
                         audio_hash = sha256_bytes(f.read())
-                    transcript_upsert(app.meeting_id, audio_hash, transcript)
+                    transcript_upsert_local(app.meeting_id, audio_hash, transcript)
                 finally:
                     safe_unlink(audio_path)
 
-            if not transcript.strip():
+            if not (app.last_transcript or "").strip():
                 st.error("No transcript available. Upload media in **Tracking** or here.")
             else:
                 if not app.last_doc_text:
-                    conn = db_conn()
-                    with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-                        cur.execute("SELECT text FROM documents WHERE meeting_id=%s ORDER BY created_at DESC LIMIT 1", (app.meeting_id,))
-                        row = cur.fetchone()
-                    conn.close()
-                    app.last_doc_text = (row or {}).get("text") or ""
+                    app.last_doc_text = get_latest_document_text_local(app.meeting_id)
                 app.chunks = build_chunks(app.last_doc_text)
 
                 q = (", ".join(app.discussion_points or []) + " " + query).strip()
@@ -750,10 +734,10 @@ with tab_summary:
                 chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm) if llm else None
                 obj = run_json(chain,
                                ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
-                               transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
+                               transcript=truncate_tokens(app.last_transcript, MAX_INPUT_TOKENS//2),
                                query=query)
 
-                summary_insert(app.meeting_id, query, obj)
+                summary_insert_local(app.meeting_id, query, obj)
 
                 st.markdown("### Summary (JSON)")
                 st.code(json.dumps(obj, indent=2))
@@ -766,11 +750,3 @@ with tab_summary:
 # ======= FINAL NOTE =======
 if not OPENAI_API_KEY:
     st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
-
-# === Helpful DB indexes (run once) ===
-# CREATE INDEX idx_meetings_title_date ON meetings (title, meeting_date);
-# CREATE UNIQUE INDEX idx_documents_meeting_hash ON documents (meeting_id, hash_key);
-# CREATE INDEX idx_doc_chunks_doc ON doc_chunks (document_id, chunk_index);
-# CREATE INDEX idx_indices_doc ON indices (document_id);
-# CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
-# CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
