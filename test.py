@@ -1,45 +1,60 @@
-# app.py — MeetEase (FAST, single-file, NO DB)
-# --------------------------------------------------------------------------------------
-# - No database required (stores small JSON artifacts under ./cache).
-# - OCR: PyMuPDF + Tesseract (optional).
-# - Indexing: FAISS (if available) + BM25 with disk caching.
-# - STT: faster-whisper (CTranslate2) with ffmpeg/pydub fallback.
-# - LLM: OpenAI optional (paste key in sidebar); graceful fallbacks if not set.
-# --------------------------------------------------------------------------------------
+# MeetEase — FAST version (optimized)
+# -------------------------------------------------------------
+# Key improvements:
+# - Switch to faster-whisper (CTranslate2) for 2–10× faster STT on CPU/GPU
+# - Replace MoviePy with direct ffmpeg extraction (much faster & safer)
+# - Aggressive caching for embeddings, tokenizers, splitters, and extracted text
+# - Skip re-embedding when document+settings unchanged (settings hash includes doc_hash)
+# - Smarter PDF OCR: only OCR low-text pages; lower DPI to 200
+# - Larger chunk size to reduce chunk count (1400/160 overlap)
+# - DB index suggestions (keep in README / migrations)
+# -------------------------------------------------------------
 
 from __future__ import annotations
 
-import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, gc, subprocess, shutil, sys, uuid
+import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, gc, subprocess, shutil
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
+from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# Load environment variables
+load_dotenv()
 
-# ============================== CONFIG ===============================
-# You can override via environment variables if you want
-OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
+# ------------------ ENV (as requested) ------------------
+# Supabase PostgreSQL Configuration
+SUPABASE_HOST     = os.getenv("SUPABASE_HOST", "db.mvnvxfuiyggatlakgrbr.supabase.co")
+SUPABASE_PORT     = os.getenv("SUPABASE_PORT", "5432")
+SUPABASE_USER     = os.getenv("SUPABASE_USER", "postgres")
+SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD", "MeetEase@4545")
+SUPABASE_DB       = os.getenv("SUPABASE_DATABASE", "postgres")
 
-# Embeddings
-EMBED_MODE         = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
-MINILM_MODEL_NAME  = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
-
-# Whisper / OCR / Tokenization
-WHISPER_MODEL      = os.getenv("MEETEASE_WHISPER_MODEL", "base")
-TEMPERATURE        = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
-MAX_INPUT_TOKENS   = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
-TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
-
-# Caches & uploads
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
+# chalse k env ma nakhvu pdse?
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
 
-# ============================== UI ===============================
+# Embeddings & LLM config
+EMBED_MODE = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
+MINILM_MODEL_NAME = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
+OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
+
+# Whisper / OCR config
+WHISPER_MODEL = os.getenv("MEETEASE_WHISPER_MODEL", "base")
+TEMPERATURE   = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
+MAX_INPUT_TOKENS = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
+TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ------------------ UI -------------------
 import streamlit as st
-st.set_page_config(page_title="MeetEase — Meeting Management (No-DB)", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="MeetEase — Meeting Management", page_icon="🎯", layout="wide")
 st.markdown("""
 <style>
 .main .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
@@ -58,53 +73,26 @@ textarea {border-radius: 10px !important;}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management (No-DB)</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance — all cached locally.</div>', unsafe_allow_html=True)
+st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance.</div>', unsafe_allow_html=True)
 st.write("")
 
-# Sidebar: OpenAI key (not persisted to disk)
-st.sidebar.header("🔐 API Keys")
-if "OPENAI_API_KEY" not in st.session_state:
-    st.session_state.OPENAI_API_KEY = ""
-st.session_state.OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password", value=st.session_state.OPENAI_API_KEY or "")
-if st.session_state.OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = st.session_state.OPENAI_API_KEY
+# ------------------ DB -------------------
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-# ============================== FILE STORAGE (NO DB) ===============================
-def _slug(s: str) -> str:
-    s = re.sub(r"[^\w\-]+", "-", s.strip().lower()).strip("-")
-    return re.sub(r"-+", "-", s) or "session"
+def db_conn():
+    return psycopg2.connect(
+        host=SUPABASE_HOST, 
+        port=SUPABASE_PORT,
+        user=SUPABASE_USER, 
+        password=SUPABASE_PASSWORD,
+        database=SUPABASE_DB,
+        sslmode='require',  # Supabase requires SSL
+        cursor_factory=RealDictCursor
+    )
 
-def _session_id(title: str, mdate: date, doc_hash: str) -> str:
-    base = f"{_slug(title)}-{mdate.isoformat()}-{doc_hash[:8]}"
-    return base
-
-def _sess_dir(session_id: str) -> str:
-    d = os.path.join(CACHE_DIR, session_id)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _write_text(path: str, text: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text or "")
-
-def _read_text(path: str) -> str:
-    if not os.path.isfile(path): return ""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-def _write_json(path: str, obj: Dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def _read_json(path: str) -> Dict:
-    if not os.path.isfile(path): return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# ============================== OCR / FILES ===============================
+# ---------------- OCR / FILES ------------
 from PIL import Image
 import numpy as np
 import pytesseract
@@ -122,60 +110,33 @@ def settings_hash(d: Dict) -> str:
     s = json.dumps(d, sort_keys=True)
     return hashlib.sha256(s.encode()).hexdigest()
 
-# ============================== TOKENIZER ===============================
+# -------------- CACHES -------------------
 @st.cache_resource(show_spinner=False)
 def token_encoder_cached():
-    try:
-        import tiktoken
-        try: return tiktoken.encoding_for_model(OPENAI_MODEL)
-        except Exception: return tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        class _Dummy:
-            def encode(self, x): return list(x.encode("utf-8"))
-            def decode(self, ids): return bytes(ids).decode("utf-8", errors="ignore")
-        return _Dummy()
+    import tiktoken
+    try: return tiktoken.encoding_for_model(OPENAI_MODEL)
+    except Exception: return tiktoken.get_encoding("cl100k_base")
 
 def truncate_tokens(text: str, max_tokens: int) -> str:
     enc = token_encoder_cached()
     ids = enc.encode(text or "")
     return enc.decode(ids[:max_tokens])
 
-# ============================== EMBEDDINGS / VECTORS ===============================
-FAISS_AVAILABLE = True
-try:
-    from langchain_community.vectorstores import FAISS
-except Exception:
-    FAISS_AVAILABLE = False
-    FAISS = None
-
-HF_OK = True
-try:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-except Exception:
-    HF_OK = False
-    HuggingFaceEmbeddings = None
-
-OPENAI_EMB_OK = True
-try:
-    from langchain_openai import OpenAIEmbeddings
-except Exception:
-    OPENAI_EMB_OK = False
-    OpenAIEmbeddings = None
-
+# -------- Embeddings / FAISS / BM25 -----
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
 from rank_bm25 import BM25Okapi
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings_cached():
-    if EMBED_MODE == "openai" and st.session_state.OPENAI_API_KEY and OPENAI_EMB_OK:
+    if EMBED_MODE == "openai" and OPENAI_API_KEY:
         return OpenAIEmbeddings(model=OPENAI_EMBED_MODEL)
-    if HF_OK:
-        return HuggingFaceEmbeddings(model_name=MINILM_MODEL_NAME, encode_kwargs={"normalize_embeddings": True})
-    # Minimal dummy fallback
-    class _Tiny:
-        def embed_documents(self, texts): return [[hashlib.md5(t.encode()).hexdigest().__hash__()%997] for t in texts]
-        def embed_query(self, text): return [hashlib.md5(text.encode()).hexdigest().__hash__()%997]
-    return _Tiny()
+    return HuggingFaceEmbeddings(
+        model_name=MINILM_MODEL_NAME,
+        encode_kwargs={"normalize_embeddings": True}
+    )
 
 @st.cache_resource(show_spinner=False)
 def get_splitter():
@@ -186,159 +147,7 @@ def build_chunks(text: str) -> List[str]:
     chunks = splitter.split_text(text or "")
     return chunks if chunks else [text or ""]
 
-def faiss_save(store, path_dir: str):
-    if FAISS_AVAILABLE and store is not None:
-        os.makedirs(path_dir, exist_ok=True)
-        store.save_local(path_dir)
-
-def faiss_load(path_dir: str, embeddings):
-    if not FAISS_AVAILABLE or not os.path.isdir(path_dir): 
-        return None
-    try:
-        return FAISS.load_local(path_dir, embeddings, allow_dangerous_deserialization=True)
-    except Exception:
-        return None
-
-def bm25_save(bm25: BM25Okapi, path_file: str):
-    os.makedirs(os.path.dirname(path_file), exist_ok=True)
-    with open(path_file, "wb") as f:
-        pickle.dump(bm25, f)
-
-def bm25_load(path_file: str) -> Optional[BM25Okapi]:
-    if not os.path.isfile(path_file): return None
-    with open(path_file, "rb") as f:
-        return pickle.load(f)
-
-# ============================== LLM ===============================
-CHAT_OK = True
-try:
-    from langchain_openai import ChatOpenAI
-    from langchain.prompts import PromptTemplate
-    from langchain.chains import LLMChain
-except Exception:
-    CHAT_OK = False
-    ChatOpenAI = PromptTemplate = LLMChain = None
-
-if CHAT_OK:
-    AGENDA_PROMPT = PromptTemplate(
-        input_variables=["discussion_points", "context"],
-        template=(
-            "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
-            "Discussion points:\n{discussion_points}\n\n"
-            "Relevant context (from docs):\n{context}\n\n"
-            "Return a professional agenda with clear sections and a logical flow."
-        ),
-    )
-    SUMMARY_PROMPT_JSON = PromptTemplate(
-        input_variables=["ctx", "transcript", "query"],
-        template=(
-            "Using the context and transcript, produce a crisp post-meeting summary with:\n"
-            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items (owner & due date if stated)\n\n"
-            "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
-            "Return JSON with keys: topics, decisions, action_items."
-        ),
-    )
-
-@st.cache_resource(show_spinner=False)
-def maybe_llm(max_tokens=400, temperature=0.2):
-    if not (st.session_state.OPENAI_API_KEY and CHAT_OK):
-        return None
-    return ChatOpenAI(model=OPENAI_MODEL, temperature=temperature, max_tokens=max_tokens)
-
-def run_json(chain, **kwargs) -> Dict:
-    if chain is None:
-        return {"topics": [], "decisions": [], "action_items": []}
-    out = chain.run(**kwargs).strip()
-    try:
-        obj = json.loads(out)
-        if isinstance(obj, dict): return obj
-    except Exception:
-        pass
-    m = re.search(r"{.*}", re.sub(r"```json|```", "", out), flags=re.S)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    return {"topics": [], "decisions": [], "action_items": []}
-
-def dedupe_lines(text: str) -> str:
-    seen, out = set(), []
-    for line in [l.strip() for l in (text or "").splitlines() if l.strip()]:
-        key = re.sub(r"\W+","", line.lower())
-        if key in seen: continue
-        seen.add(key); out.append(line)
-    return "\n".join(out)
-
-# ============================== STT ===============================
-FW_OK = True
-try:
-    from faster_whisper import WhisperModel
-except Exception:
-    FW_OK = False
-    WhisperModel = None
-
-from pydub import AudioSegment
-
-@st.cache_resource(show_spinner=False)
-def load_whisper(model_name: str):
-    if not FW_OK:
-        return None
-    device = "cuda" if (os.getenv("CUDA_VISIBLE_DEVICES") not in (None, "", "-1")) else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    return WhisperModel(model_name, device=device, compute_type=compute_type)
-
-def safe_tmp_path(suffix=".wav") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    return path
-
-def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
-    for i in range(max_tries):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-            return
-        except PermissionError:
-            time.sleep(wait_s * (i + 1))
-            gc.collect()
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
-
-def extract_audio_to_wav(media_path: str) -> str:
-    out_wav = safe_tmp_path(".wav")
-    ff = shutil.which("ffmpeg")
-    if ff:
-        subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    else:
-        # Fallback: pydub (works if codecs present in the environment)
-        AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
-    return out_wav
-
-def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
-    model = load_whisper(WHISPER_MODEL)
-    if model is None:
-        return "(Transcription unavailable: faster-whisper not installed on host)"
-    segments, info = model.transcribe(
-        audio_path, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=800)
-    )
-    text_parts, total_dur = [], (getattr(info, "duration", None) or 1.0)
-    last_t = 0.0
-    for seg in segments:
-        text_parts.append(seg.text.strip())
-        last_t = getattr(seg, "end", None) or last_t
-        if progress_cb:
-            p = min(1.0, last_t / total_dur)
-            progress_cb(p, max(0.0, total_dur - last_t))
-    final = " ".join(t for t in text_parts if t)
-    final = re.sub(r"\s+", " ", final).strip()
-    return dedupe_lines(final)
-
-# ============================== OCR EXTRACTORS ===============================
+# ---------- OCR helpers (fast) -----------
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3,3), 0)
@@ -363,15 +172,16 @@ def pil_ocr(img_bgr: np.ndarray) -> str:
 def cached_extract_pdf_text(doc_hash: str, pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
+    total = doc.page_count or 1
     for i in range(doc.page_count):
         pg = doc.load_page(i)
         raw = pg.get_text("text").strip()
-        if len(raw) < 80:
-            pix = pg.get_pixmap(dpi=200)
+        if len(raw) < 80:  # only OCR low-text pages
+            pix = pg.get_pixmap(dpi=200)  # reduced DPI for speed
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             proc = preprocess_for_ocr(bgr)
-            raw = pytesseract.image_to_string(Image.fromarray(proc))
+            raw = pil_ocr(proc)
         out.append(raw)
     return "\n".join(out)
 
@@ -390,48 +200,317 @@ def cached_extract_image_text(doc_hash: str, img_bytes: bytes) -> str:
         raw = pytesseract.image_to_string(Image.fromarray(proc))
     return raw
 
-# ============================== RAG HELPERS ===============================
-def build_and_persist_indices(session_id: str, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict):
+# ------------- LLM / Prompts -------------
+import tiktoken  # still imported so cache can resolve
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+
+AGENDA_PROMPT = PromptTemplate(
+      input_variables=["discussion_points", "context"],
+        template=(
+            "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
+            "Discussion points:\n{discussion_points}\n\n"
+            "Relevant context (from docs):\n{context}\n\n"
+            "Return a professional agenda with sections, timings (optional), and logical flow."
+        ),
+)
+SUMMARY_PROMPT_JSON = PromptTemplate(
+        input_variables=["ctx", "transcript", "query"],
+        template=(
+            "Using the context and transcript, produce a crisp post-meeting summary with:\n"
+            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items with Owners & due dates when stated\n\n"
+            "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
+        ),
+)
+
+@st.cache_resource(show_spinner=False)
+def maybe_llm(max_tokens=400, temperature=TEMPERATURE):
+    if not OPENAI_API_KEY:
+        return None
+    return ChatOpenAI(model=OPENAI_MODEL, temperature=temperature, max_tokens=max_tokens)
+
+def run_json(chain: Optional[LLMChain], **kwargs) -> Dict:
+    out = chain.run(**kwargs).strip() if chain else ""
+    try:
+        obj = json.loads(out)
+        if isinstance(obj, dict): return obj
+    except Exception:
+        pass
+    m = re.search(r"{.*}", re.sub(r"```json|```", "", out), flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {"Context":"(LLM unavailable)", "Decisions":[], "ActionItems":[], "Risks":[]}
+
+def dedupe_lines(text: str) -> str:
+    seen, out = set(), []
+    for line in [l.strip() for l in (text or "").splitlines() if l.strip()]:
+        key = re.sub(r"\W+","", line.lower())
+        if key in seen: continue
+        seen.add(key); out.append(line)
+    return "\n".join(out)
+
+# ------------------ STT (FAST) ------------------
+from pydub import AudioSegment
+from faster_whisper import WhisperModel
+
+@st.cache_resource(show_spinner=False)
+def load_whisper(model_name: str):
+    device = "cuda" if (os.getenv("CUDA_VISIBLE_DEVICES") not in (None, "", "-1")) else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    return WhisperModel(model_name, device=device, compute_type=compute_type)
+
+# Windows-safe temp helpers
+
+def safe_tmp_path(suffix=".wav") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return path
+
+def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
+    for i in range(max_tries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(wait_s * (i + 1))
+            gc.collect()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+# Fast audio extraction using ffmpeg or pydub fallback
+
+def extract_audio_to_wav(media_path: str) -> str:
+    out_wav = safe_tmp_path(".wav")
+    ff = shutil.which("ffmpeg")
+    if ff:
+        subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    else:
+        # Fallback if ffmpeg not found
+        AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
+    return out_wav
+
+# Optional light filter (kept simple for speed)
+def spectral_gate(seg: AudioSegment) -> AudioSegment:
+    try:
+        return seg.high_pass_filter(80).low_pass_filter(8000)
+    except Exception:
+        return seg
+
+# Single-pass transcription with built-in VAD
+
+def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
+    model = load_whisper(WHISPER_MODEL)
+    segments, info = model.transcribe(
+        audio_path,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=800)
+    )
+    text_parts, total_dur = [], (info.duration or 1.0)
+    last_t = 0.0
+    for seg in segments:
+        text_parts.append(seg.text.strip())
+        last_t = seg.end or last_t
+        if progress_cb:
+            p = min(1.0, last_t / total_dur)
+            progress_cb(p, max(0.0, total_dur - last_t))
+    final = " ".join(t for t in text_parts if t)
+    final = re.sub(r"\s+", " ", final).strip()
+    return dedupe_lines(final)
+
+# --------------- DB HELPERS --------------
+
+def meeting_get_or_create(title: str, mdate: date) -> int:
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM meetings WHERE title=%s AND meeting_date=%s", (title, mdate))
+            row = cur.fetchone()
+            if row: return row["id"]
+            cur.execute("INSERT INTO meetings (title, meeting_date) VALUES (%s, %s) RETURNING id", (title, mdate))
+            conn.commit()
+            return cur.fetchone()["id"]
+    finally:
+        conn.close()
+
+def document_get_or_create(meeting_id: int, name: str, mime: str, content: bytes) -> Tuple[int, str]:
+    h = sha256_bytes(content)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM documents WHERE hash_key=%s AND meeting_id=%s", (h, meeting_id))
+            r = cur.fetchone()
+            if r: return r["id"], h
+            cur.execute(
+                "INSERT INTO documents (meeting_id, name, mime, hash_key) VALUES (%s,%s,%s,%s) RETURNING id",
+                (meeting_id, name, mime, h)
+            )
+            conn.commit()
+            return cur.fetchone()["id"], h
+    finally:
+        conn.close()
+
+def document_update_text(doc_id: int, text: str):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE documents SET text=%s WHERE id=%s", (text, doc_id))
+            conn.commit()
+    finally:
+        conn.close()
+
+def chunks_upsert(doc_id: int, chunks: List[str]):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM doc_chunks WHERE document_id=%s", (doc_id,))
+            for i, c in enumerate(chunks):
+                hk = sha256_bytes(c.encode("utf-8"))
+                cur.execute(
+                    "INSERT INTO doc_chunks (document_id, chunk_index, text, hash_key) VALUES (%s,%s,%s,%s)",
+                    (doc_id, i, c, hk)
+                )
+            conn.commit()
+    finally:
+        conn.close()
+
+def indices_get(doc_id: int):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM indices WHERE document_id=%s", (doc_id,))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+def indices_upsert(doc_id: int, doc_hash: str, bm25_path: str, embed_index_path: str, embed_model: str):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM indices WHERE document_id=%s", (doc_id,))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "UPDATE indices SET doc_hash=%s, bm25_path=%s, embed_index_path=%s, embed_model=%s WHERE id=%s",
+                    (doc_hash, bm25_path, embed_index_path, embed_model, row["id"])
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO indices (document_id, doc_hash, bm25_path, embed_index_path, embed_model) VALUES (%s,%s,%s,%s,%s)",
+                    (doc_id, doc_hash, bm25_path, embed_index_path, embed_model)
+                )
+            conn.commit()
+    finally:
+        conn.close()
+
+def agenda_insert(meeting_id: int, agenda_text: str):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO agendas (meeting_id, agenda_text) VALUES (%s,%s)", (meeting_id, agenda_text))
+            conn.commit()
+    finally:
+        conn.close()
+
+def transcript_upsert(meeting_id: int, audio_hash: str, transcript_text: str):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM transcripts WHERE meeting_id=%s AND audio_hash=%s", (meeting_id, audio_hash))
+            r = cur.fetchone()
+            if r:
+                cur.execute("UPDATE transcripts SET transcript=%s WHERE id=%s", (transcript_text, r["id"]))
+            else:
+                cur.execute("INSERT INTO transcripts (meeting_id, audio_hash, transcript) VALUES (%s,%s,%s)",
+                            (meeting_id, audio_hash, transcript_text))
+            conn.commit()
+    finally:
+        conn.close()
+
+def summary_insert(meeting_id: int, query_text: str, summary_json: Dict):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO summaries (meeting_id, query_text, summary_text) VALUES (%s,%s,%s)",
+                        (meeting_id, query_text, json.dumps(summary_json, ensure_ascii=False)))
+            conn.commit()
+    finally:
+        conn.close()
+
+# ------------ RAG helpers ------------
+
+def faiss_save(store: FAISS, path_dir: str):
+    os.makedirs(path_dir, exist_ok=True)
+    store.save_local(path_dir)
+
+def faiss_load(path_dir: str, embeddings):
+    if not os.path.isdir(path_dir): return None
+    try:
+        return FAISS.load_local(path_dir, embeddings, allow_dangerous_deserialization=True)
+    except Exception:
+        return None
+
+def bm25_save(bm25: BM25Okapi, path_file: str):
+    os.makedirs(os.path.dirname(path_file), exist_ok=True)
+    with open(path_file, "wb") as f:
+        pickle.dump(bm25, f)
+
+def bm25_load(path_file: str) -> Optional[BM25Okapi]:
+    if not os.path.isfile(path_file): return None
+    with open(path_file, "rb") as f:
+        return pickle.load(f)
+
+# Build or load indices quickly; settings include doc_hash to avoid rebuilds when unchanged
+
+def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict) -> Tuple[FAISS, BM25Okapi, List[str], str, str]:
     s_hash = settings_hash({
         "embed_mode": embed_mode,
         "model": MINILM_MODEL_NAME if embed_mode=="minilm" else OPENAI_EMBED_MODEL,
         "splitter": splitter_conf,
         "doc_hash": doc_hash,
     })
-    sess_dir = _sess_dir(session_id)
-    faiss_dir = os.path.join(sess_dir, f"faiss_{s_hash[:8]}")
-    bm25_path = os.path.join(sess_dir, f"bm25_{s_hash[:8]}.pkl")
+    faiss_dir = os.path.join(CACHE_DIR, f"faiss_{doc_id}_{s_hash[:8]}")
+    bm25_path = os.path.join(CACHE_DIR, f"bm25_{doc_id}_{s_hash[:8]}.pkl")
+
+    if os.path.isdir(faiss_dir) and os.path.isfile(bm25_path):
+        embeddings = get_embeddings_cached()
+        store = faiss_load(faiss_dir, embeddings)
+        bm25 = bm25_load(bm25_path)
+        chunks = build_chunks(full_text)
+        if store and bm25:
+            chunks_upsert(doc_id, chunks)
+            return store, bm25, chunks, faiss_dir, bm25_path
 
     embeddings = get_embeddings_cached()
     chunks = build_chunks(full_text)
-
-    store = None
-    if FAISS_AVAILABLE:
-        if os.path.isdir(faiss_dir):
-            store = faiss_load(faiss_dir, embeddings)
-        if store is None:
-            try:
-                from langchain_community.vectorstores import FAISS as _FAISS
-                store = _FAISS.from_texts(chunks, embeddings)
-                faiss_save(store, faiss_dir)
-            except Exception:
-                store = None  # continue with BM25
-
-    bm25 = bm25_load(bm25_path)
-    if bm25 is None:
-        bm25 = BM25Okapi([c.split() for c in chunks])
-        bm25_save(bm25, bm25_path)
-
-    # persist chunks too (for debug/inspection)
-    _write_json(os.path.join(sess_dir, "chunks.json"), {"chunks": chunks})
-    # remember index metadata
-    _write_json(os.path.join(sess_dir, "indices.json"), {
-        "doc_hash": doc_hash, "bm25_path": bm25_path, "faiss_path": faiss_dir if store else "", 
-        "embed_mode": ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME)
-    })
+    store = FAISS.from_texts(chunks, embeddings)
+    faiss_save(store, faiss_dir)
+    bm25 = BM25Okapi([c.split() for c in chunks])
+    bm25_save(bm25, bm25_path)
+    chunks_upsert(doc_id, chunks)
+    indices_upsert(doc_id, doc_hash, bm25_path, faiss_dir,
+                   ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME))
     return store, bm25, chunks, faiss_dir, bm25_path
 
-def select_context(store, bm25, chunks: List[str], query: str, k:int=4) -> str:
+
+def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Optional[BM25Okapi], Optional[List[str]]]:
+    rec = indices_get(doc_id)
+    if not rec: return None, None, None
+    embeddings = get_embeddings_cached()
+    store = faiss_load(rec.get("embed_index_path",""), embeddings)
+    bm25  = bm25_load(rec.get("bm25_path","")) if rec.get("bm25_path") else None
+    return store, bm25, None
+
+
+def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
     ctx = ""
     if store:
         try:
@@ -440,11 +519,13 @@ def select_context(store, bm25, chunks: List[str], query: str, k:int=4) -> str:
         except Exception:
             pass
     if (not ctx) and bm25 and chunks:
-        import numpy as _np
+        import numpy as np
         scores = bm25.get_scores(query.split())
-        top_idx = _np.argsort(scores)[-k:][::-1]
+        top_idx = np.argsort(scores)[-k:][::-1]
         ctx = "\n\n".join(chunks[i] for i in top_idx)
     return ctx
+
+# ---------- Agenda Resolution ----------
 
 def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tuple[List[str], List[str]]:
     t = (transcript or "").lower()
@@ -459,51 +540,46 @@ def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tupl
             if any(k in window for k in resolved_kw): resolved.append(p)
             elif any(k in window for k in unresolved_kw): unresolved.append(p)
             else: unresolved.append(p)
-        else:
-            unresolved.append(p)
+        else: unresolved.append(p)
     return resolved, unresolved
 
-# ============================== DIAGNOSTICS ===============================
-with st.expander("🔧 Diagnostics (click to expand)"):
-    info_cols = st.columns(2)
-    with info_cols[0]:
-        st.write("**Python**", sys.version.split()[0])
-        st.write("**Platform**", sys.platform)
-        st.write("**ffmpeg**", shutil.which("ffmpeg") or "not-found")
-        st.write("**tesseract**", shutil.which("tesseract") or (TESSERACT_PATH_WIN or "not-found"))
-        st.write("**faster-whisper**", "OK" if FW_OK else "missing")
-        st.write("**FAISS**", "OK" if FAISS_AVAILABLE else "missing (BM25 fallback)")
-        st.write("**HF Embeddings**", "OK" if HF_OK else "missing")
-        st.write("**OpenAI (LLM/Emb)**", "enabled" if st.session_state.OPENAI_API_KEY else "disabled")
-    with info_cols[1]:
-        sess_count = len([d for d in os.listdir(CACHE_DIR) if os.path.isdir(os.path.join(CACHE_DIR, d))])
-        st.write("**Cache dir**", os.path.abspath(CACHE_DIR))
-        st.write("**Sessions cached**", sess_count)
+# --------------- Quality CSV ------------
+METRICS_CSV = os.path.join(CACHE_DIR, "quality_metrics.csv")
 
-# ============================== APP STATE ===============================
+def metrics_csv_init():
+    if not os.path.isfile(METRICS_CSV):
+        with open(METRICS_CSV, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f); w.writerow(["ts","meeting_id","ocr_hit_proxy","stt_wer","usefulness"])
+
+def metrics_csv_append(meeting_id: int, ocr_hit_proxy: Optional[float], stt_wer: Optional[float], usefulness: Optional[float]):
+    metrics_csv_init()
+    with open(METRICS_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([datetime.utcnow().isoformat(), meeting_id, ocr_hit_proxy, stt_wer, usefulness])
+
+# --------------- UI STATE ---------------
 @dataclass
 class AppState:
-    session_id: Optional[str] = None
+    meeting_id: Optional[int] = None
+    document_id: Optional[int] = None
     document_hash: Optional[str] = None
     discussion_points: Optional[List[str]] = None
     chunks: Optional[List[str]] = None
-    faiss_store: Optional[object] = None
+    faiss_store: Optional[FAISS] = None
     bm25: Optional[BM25Okapi] = None
     last_transcript: Optional[str] = None
     last_doc_text: Optional[str] = None
-    last_agenda: Optional[str] = None
-    last_summary: Optional[Dict] = None
 
 if "app" not in st.session_state:
     st.session_state.app = AppState()
 app: AppState = st.session_state.app
 
-# ============================== TABS ===============================
+# ----------------- TABS ------------------
 tab_pre, tab_agenda, tab_track, tab_summary = st.tabs(
-    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary"]
+    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary",]
 )
 
-# ---------------- PRE-MEETING ----------------
+# -------- PRE-MEETING TAB --------
 with tab_pre:
     st.markdown("### 📄 Pre-Meeting — Documents & Discussion Points")
     colA, colB = st.columns([1.15, 1])
@@ -514,6 +590,7 @@ with tab_pre:
         up = st.file_uploader("Upload a document (PDF, DOCX, or Image)", type=["pdf", "docx", "png", "jpg", "jpeg"])
         dpoints = st.text_area("Discussion points (comma-separated)", placeholder="Budget approval, Roadmap alignment, Risk review ...", height=120)
 
+        ocr_placeholder = st.empty()
         ocr_bar = st.progress(0.0, text="Waiting for document...")
 
         if st.button("Process & Build Context", type="primary", use_container_width=True):
@@ -522,55 +599,56 @@ with tab_pre:
             if not up or not dpoints.strip():
                 st.warning("Please upload a document and add discussion points."); st.stop()
 
-            raw = up.read()
-            doc_hash = sha256_bytes(raw)
-            app.document_hash = doc_hash
-            session_id = _session_id(title.strip(), mdate, doc_hash)
-            app.session_id = session_id
-            sess_dir = _sess_dir(session_id)
+            app.meeting_id = meeting_get_or_create(title.strip(), mdate)
 
-            # Extract or reuse text
-            extracted_path = os.path.join(sess_dir, "extracted.txt")
-            if os.path.isfile(extracted_path):
-                text = _read_text(extracted_path)
-                ocr_bar.progress(1.0, text="Reusing cached text")
-            else:
+            raw = up.read()
+            app.document_id, app.document_hash = document_get_or_create(app.meeting_id, up.name, up.type or "", raw)
+
+            # Extract or reuse text (cached by doc hash)
+            text = None
+            conn = db_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT text FROM documents WHERE id=%s", (app.document_id,))
+                row = cur.fetchone()
+            conn.close()
+            text = (row or {}).get("text")
+
+            if not text:
                 ext = (up.name.split(".")[-1] or "").lower()
                 if ext == "pdf":
                     ocr_bar.progress(0.2, text="Extracting PDF text...")
-                    text = cached_extract_pdf_text(doc_hash, raw)
+                    text = cached_extract_pdf_text(app.document_hash, raw)
                     ocr_bar.progress(1.0, text="PDF processed")
                 elif ext == "docx":
                     ocr_bar.progress(0.3, text="Extracting from DOCX...")
-                    text = cached_extract_docx_text(doc_hash, raw)
+                    text = cached_extract_docx_text(app.document_hash, raw)
                     ocr_bar.progress(1.0, text="DOCX extracted")
                 elif ext in ("png","jpg","jpeg"):
                     ocr_bar.progress(0.3, text="OCR image...")
-                    text = cached_extract_image_text(doc_hash, raw)
+                    text = cached_extract_image_text(app.document_hash, raw)
                     ocr_bar.progress(1.0, text="Image OCR done")
                 else:
                     st.error("Unsupported file type."); st.stop()
-                _write_text(extracted_path, text)
+                document_update_text(app.document_id, text)
+            else:
+                ocr_bar.progress(1.0, text="Reusing cached text")
 
             app.last_doc_text = text
 
-            # Build or load indices
+            # Build or load indices with settings-hash
             st.info("Building / loading indices...")
             splitter_conf = {"chunk_size":1400, "overlap":160}
             app.faiss_store, app.bm25, app.chunks, _, _ = build_and_persist_indices(
-                session_id, doc_hash, app.last_doc_text or "", EMBED_MODE, splitter_conf
+                app.document_id, app.document_hash or "", app.last_doc_text or "",
+                EMBED_MODE, splitter_conf
             )
 
             app.discussion_points = [p.strip() for p in dpoints.split(",") if p.strip()]
-            _write_json(os.path.join(sess_dir, "meta.json"), {
-                "title": title.strip(), "date": mdate.isoformat(), "discussion_points": app.discussion_points
-            })
-
-            st.success(f"Context ready! Session: `{session_id}` → Go to **Agenda** to generate an agenda.")
+            st.success("Context ready! Go to **Agenda** to generate an agenda.")
 
     with colB:
         st.markdown("#### Document Snapshot")
-        if app.last_doc_text:
+        if app.document_id:
             preview = app.last_doc_text or ""
             token_count = len(preview.split())
             st.markdown(f'<div class="card"><div class="kv"><b>Words</b> {token_count}</div><div class="kv"><b>Preview</b></div></div>', unsafe_allow_html=True)
@@ -579,10 +657,10 @@ with tab_pre:
         else:
             st.info("No document processed yet.")
 
-# ---------------- AGENDA ----------------
+# -------- AGENDA TAB --------
 with tab_agenda:
     st.markdown("### 📋 Agenda Creation")
-    if not (app.session_id and app.discussion_points and (app.faiss_store or app.bm25)):
+    if not (app.meeting_id and app.discussion_points and app.faiss_store):
         st.warning("Please complete **Pre-Meeting** first.")
     else:
         st.markdown("**Your discussion points**")
@@ -592,26 +670,23 @@ with tab_agenda:
             q = " ".join(app.discussion_points)
             ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
             llm = maybe_llm(max_tokens=400, temperature=TEMPERATURE)
-            if CHAT_OK and llm:
-                chain = LLMChain(prompt=AGENDA_PROMPT, llm=llm)
-                in_ctx = truncate_tokens(ctx, MAX_INPUT_TOKENS // 2)
+            chain = LLMChain(prompt=AGENDA_PROMPT, llm=llm) if llm else None
+            in_ctx = truncate_tokens(ctx, MAX_INPUT_TOKENS // 2)
+            if chain:
                 agenda_md = chain.run(discussion_points="\n- " + "\n- ".join(app.discussion_points), context=in_ctx)
             else:
                 agenda_md = "## Agenda\n" + "\n".join(f"- {p}" for p in app.discussion_points)
-
-            app.last_agenda = agenda_md
-            _write_text(os.path.join(_sess_dir(app.session_id), "agenda.md"), agenda_md)
-
-            st.success("Agenda generated and saved to cache!")
+            agenda_insert(app.meeting_id, agenda_md)
+            st.success("Agenda generated and saved!")
             st.markdown("### Generated Agenda")
             st.markdown(f'<div class="card">{agenda_md}</div>', unsafe_allow_html=True)
             st.download_button("Download Agenda (.md)", data=agenda_md.encode("utf-8"),
                                file_name="agenda.md", mime="text/markdown", use_container_width=True)
 
-# ---------------- TRACKING ----------------
+# -------- TRACKING TAB --------
 with tab_track:
     st.markdown("### 🎥 Meeting Tracking & Agenda Resolution")
-    if not (app.session_id and app.discussion_points):
+    if not (app.meeting_id and app.discussion_points):
         st.warning("No agenda points available. Please finish **Pre-Meeting**.")
     else:
         v = st.file_uploader("Upload meeting video or audio", type=["mp4", "mov", "avi", "wav", "mp3", "m4a"])
@@ -630,6 +705,7 @@ with tab_track:
                     tmp_v.write(v.getbuffer())
                     media_path = tmp_v.name
 
+                # Extract audio fast
                 audio_path = extract_audio_to_wav(media_path)
                 safe_unlink(media_path)
 
@@ -641,7 +717,9 @@ with tab_track:
                     transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
                     transcript = dedupe_lines(transcript)
                     app.last_transcript = transcript
-                    _write_text(os.path.join(_sess_dir(app.session_id), "transcript.txt"), transcript)
+                    with open(audio_path, "rb") as f:
+                        audio_hash = sha256_bytes(f.read())
+                    transcript_upsert(app.meeting_id, audio_hash, transcript)
                     trans_bar.progress(1.0, text="Transcription complete")
                 finally:
                     safe_unlink(audio_path)
@@ -661,10 +739,10 @@ with tab_track:
                 with st.expander("Show Transcript"):
                     st.write(app.last_transcript or "")
 
-# ---------------- SUMMARY ----------------
+# -------- SUMMARY TAB --------
 with tab_summary:
     st.markdown("### 📝 Post-Meeting Summary")
-    if not (app.session_id and (app.faiss_store or app.bm25)):
+    if not (app.meeting_id and app.faiss_store):
         st.warning("Please complete **Pre-Meeting** so RAG context is available.")
     else:
         v2 = st.file_uploader("Upload meeting media (optional)", type=["mp4","mov","avi","wav","mp3","m4a"], key="post_vid")
@@ -689,7 +767,9 @@ with tab_summary:
                     transcript = transcribe_long_audio(audio_path, progress_cb=_progress_cb)
                     transcript = dedupe_lines(transcript)
                     app.last_transcript = transcript
-                    _write_text(os.path.join(_sess_dir(app.session_id), "transcript.txt"), transcript)
+                    with open(audio_path, "rb") as f:
+                        audio_hash = sha256_bytes(f.read())
+                    transcript_upsert(app.meeting_id, audio_hash, transcript)
                 finally:
                     safe_unlink(audio_path)
 
@@ -697,33 +777,24 @@ with tab_summary:
                 st.error("No transcript available. Upload media in **Tracking** or here.")
             else:
                 if not app.last_doc_text:
-                    # read from cache if user revisits
-                    extracted_path = os.path.join(_sess_dir(app.session_id), "extracted.txt")
-                    app.last_doc_text = _read_text(extracted_path)
+                    conn = db_conn()
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT text FROM documents WHERE meeting_id=%s ORDER BY created_at DESC LIMIT 1", (app.meeting_id,))
+                        row = cur.fetchone()
+                    conn.close()
+                    app.last_doc_text = (row or {}).get("text") or ""
                 app.chunks = build_chunks(app.last_doc_text)
 
                 q = (", ".join(app.discussion_points or []) + " " + query).strip()
                 ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
-
                 llm = maybe_llm(max_tokens=450, temperature=TEMPERATURE)
-                if CHAT_OK and llm:
-                    chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm)
-                    obj = run_json(
-                        chain,
-                        ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
-                        transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
-                        query=query
-                    )
-                else:
-                    # Heuristic fallback summary
-                    obj = {
-                        "topics": list({t.strip() for t in (", ".join(app.discussion_points or [])).split(",") if t.strip()}),
-                        "decisions": [],
-                        "action_items": []
-                    }
+                chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm) if llm else None
+                obj = run_json(chain,
+                               ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
+                               transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
+                               query=query)
 
-                app.last_summary = obj
-                _write_json(os.path.join(_sess_dir(app.session_id), "summary.json"), obj)
+                summary_insert(app.meeting_id, query, obj)
 
                 st.markdown("### Summary (JSON)")
                 st.code(json.dumps(obj, indent=2))
@@ -733,7 +804,19 @@ with tab_summary:
                                    mime="application/json",
                                    use_container_width=True)
 
-# ---------------- NOTES ----------------
-if not st.session_state.OPENAI_API_KEY:
-    st.info("No OpenAI API key set. Agenda/Summary will use robust fallbacks. Embeddings default to MiniLM (CPU).")
+# -------- METRICS & EXPORT TAB ----------
+
+
+# ======= FINAL NOTE =======
+if not OPENAI_API_KEY:
+    st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
+
+# === DB INDEX SUGGESTIONS (run once in your DB) ===
+# CREATE INDEX idx_meetings_title_date ON meetings (title, meeting_date);
+# CREATE UNIQUE INDEX idx_documents_meeting_hash ON documents (meeting_id, hash_key);
+# CREATE INDEX idx_doc_chunks_doc ON doc_chunks (document_id, chunk_index);
+# CREATE INDEX idx_indices_doc ON indices (document_id);
+# CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
+# CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
