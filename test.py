@@ -18,10 +18,12 @@ from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
 # ------------------ ENV (as requested) ------------------
-MYSQL_HOST     = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_USER     = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
-MYSQL_DB       = os.getenv("MYSQL_DB", "MeetEasee")
+MYSQL_HOST     = os.getenv("MYSQL_HOST", "aws-1-ap-southeast-1.pooler.supabase.com")
+MYSQL_USER     = os.getenv("MYSQL_USER", "Success. No rows returned")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Tirth@123")
+port=6543
+MYSQL_DB       = os.getenv("MYSQL_DB", "postgres")
+
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
@@ -800,3 +802,4 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
