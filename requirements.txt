@@ -73,6 +73,7 @@ onnxruntime
 openai
 openai-whisper
 opencv-python
+opencv
 opencv-python-headless
 orjson
 packaging
@@ -134,3 +135,4 @@ Werkzeug
 yarl
 zipp
 zstandard
+
