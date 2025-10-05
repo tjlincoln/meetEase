@@ -34,7 +34,7 @@ CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
 # chalse k env ma nakhvu pdse?
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
 
@@ -818,3 +818,4 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
