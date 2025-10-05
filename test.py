@@ -39,7 +39,7 @@ if "postgres" in st.secrets:
     PGUSER     = st.secrets["postgres"]["user"]
     PGPASSWORD = st.secrets["postgres"]["password"]
 else:
-    PGHOST     = os.getenv("PGHOST", "db.<your-project>.supabase.co")
+    PGHOST     = os.getenv("PGHOST", "db.MeetEase.supabase.co")
     PGPORT     = int(os.getenv("PGPORT", "6543"))
     PGDATABASE = os.getenv("PGDATABASE", "postgres")
     PGUSER     = os.getenv("PGUSER", "postgres")
