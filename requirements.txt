@@ -1,31 +1,33 @@
-# Core Framework
-streamlit==1.28.0
+# -----------------------------
+# MeetEase — FAST Version
+# Dependencies for Streamlit, AI, OCR, STT, and DB
+# -----------------------------
 
-# Database
-pymysql==1.1.0
+streamlit
+pymysql
+pillow
+pytesseract
+pymupdf
+python-docx
+opencv-python-headless
+numpy
+langchain
+langchain-openai
+langchain-community
+sentence-transformers
+faiss-cpu
+rank-bm25
+tiktoken
+faster-whisper
+pydub
+openai
+cryptography
+pyyaml
+coloredlogs
+filelock
+tqdm
+aiohttp
+requests
+moviepy
+imageio[ffmpeg]
 
-# AI/ML - LangChain & OpenAI
-langchain==0.1.0
-langchain-openai==0.0.5
-langchain-community==0.0.20
-openai==1.12.0
-
-# Embeddings & Vector Store
-sentence-transformers==2.3.1
-faiss-cpu==1.7.4
-rank-bm25==0.2.2
-
-# Speech-to-Text (Faster Whisper)
-faster-whisper==1.0.0
-pydub==0.25.1
-
-# Document Processing
-PyMuPDF==1.23.8
-python-docx==1.1.0
-Pillow==10.2.0
-pytesseract==0.3.10
-opencv-python-headless==4.9.0.80
-
-# Text Processing & Utilities
-tiktoken==0.5.2
-numpy==1.24.3
