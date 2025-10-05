@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, gc, subprocess, shutil, sys, uuid
+import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, gc, subprocess, shutil, sys
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
@@ -62,11 +62,20 @@ st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management (No-DB)
 st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance — all cached locally.</div>', unsafe_allow_html=True)
 st.write("")
 
-# Sidebar: OpenAI key (not persisted to disk)
+# Sidebar: OpenAI key (session-only, not persisted)
 st.sidebar.header("🔐 API Keys")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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").strip()
-if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
+if "OPENAI_API_KEY" not in st.session_state:
+    # initialize from environment if present, else empty
+    st.session_state.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+st.session_state.OPENAI_API_KEY = st.sidebar.text_input(
+    "OpenAI API Key",
+    type="password",
+    value=st.session_state.OPENAI_API_KEY or "",
+    help="Used for agenda/summary generation and (optionally) OpenAI embeddings. Not saved to disk."
+)
+# Propagate to environment for langchain_openai
+if st.session_state.OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = st.session_state.OPENAI_API_KEY
 
 # ============================== FILE STORAGE (NO DB) ===============================
 def _slug(s: str) -> str:
@@ -165,6 +174,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings_cached():
+    # Use OpenAI embeddings only if a key is present and the package is available
     if EMBED_MODE == "openai" and st.session_state.OPENAI_API_KEY and OPENAI_EMB_OK:
         return OpenAIEmbeddings(model=OPENAI_EMBED_MODEL)
     if HF_OK:
@@ -695,7 +705,6 @@ with tab_summary:
                 st.error("No transcript available. Upload media in **Tracking** or here.")
             else:
                 if not app.last_doc_text:
-                    # read from cache if user revisits
                     extracted_path = os.path.join(_sess_dir(app.session_id), "extracted.txt")
                     app.last_doc_text = _read_text(extracted_path)
                 app.chunks = build_chunks(app.last_doc_text)
@@ -734,4 +743,3 @@ with tab_summary:
 # ---------------- NOTES ----------------
 if not st.session_state.OPENAI_API_KEY:
     st.info("No OpenAI API key set. Agenda/Summary will use robust fallbacks. Embeddings default to MiniLM (CPU).")
-
