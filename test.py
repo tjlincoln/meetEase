@@ -17,19 +17,6 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
-# ------------------ ENV (as requested) ------------------
-# ------------------ DB (PostgreSQL / Supabase) -------------------
-import os
-import psycopg2
-import psycopg2.extras
-import streamlit as st
-# postgres_pool.py (paste into your Streamlit app)
-import os
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool
-import streamlit as st
-from contextlib import contextmanager
 
 import psycopg2
 
@@ -58,10 +45,65 @@ try:
     # Attempt connection
     print("\n⏳ Connecting...")
     conn = psycopg2.connect(**connection_params)
-    print("✅ Connection …
-.env
+    print("✅ Connection successful!")
+    
+    # Test query
+    cursor = conn.cursor()
+    cursor.execute("SELECT version();")
+    version = cursor.fetchone()
+    print(f"\n📊 PostgreSQL Version:")
+    print(f"   {version[0]}")
+    
+    # List databases
+    cursor.execute("""
+        SELECT datname FROM pg_database 
+        WHERE datistemplate = false 
+        ORDER BY datname;
+    """)
+    databases = cursor.fetchall()
+    print(f"\n📁 Available Databases:")
+    for db in databases:
+        print(f"   • {db[0]}")
+    
+    # List tables
+    cursor.execute("""
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+    """)
+    tables = cursor.fetchall()
+    
+    print(f"\n📋 Tables in 'public' schema:")
+    if tables:
+        for table in tables:
+            print(f"   • {table[0]}")
+    else:
+        print("   (No tables found - run setup_database.py to create them)")
+    
+    cursor.close()
+    conn.close()
+    
+    print("\n" + "=" * 70)
+    print("✅ CONNECTION TEST SUCCESSFUL!")
+    print("=" * 70)
+    print("\nYou can now run:")
+    print("  1. python setup_database.py  (to create tables)")
+    print("  2. python db_operations.py   (to test CRUD operations)")
+    
+except psycopg2.Error as e:
+    print(f"\n❌ Connection Error: {e}")
+    print("\n🔍 Troubleshooting:")
+    print("  1. Verify your Supabase project is active")
+    print("  2. Check if the hostname is correct in Supabase dashboard")
+    print("  3. Verify password: Meet.cool8")
+    print("  4. Check if your IP is allowed (Supabase -> Settings -> Database)")
+    print("  5. Verify pooler is enabled in Supabase")
+    
+except Exception as e:
+    print(f"\n❌ Unexpected Error: {e}")
 
-
+print("\n" + "=" * 70)
 # ------------------ UI -------------------
 import streamlit as st
 st.set_page_config(page_title="MeetEase — Meeting Management", page_icon="🎯", layout="wide")
@@ -816,6 +858,7 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
 
 
