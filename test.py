@@ -31,63 +31,35 @@ from psycopg2 import pool
 import streamlit as st
 from contextlib import contextmanager
 
-# Prefer st.secrets but fall back to env vars
-if "postgres" in st.secrets:
-    PGHOST     = st.secrets["postgres"]["host"]
-    PGPORT     = int(st.secrets["postgres"]["port"])
-    PGDATABASE = st.secrets["postgres"]["database"]
-    PGUSER     = st.secrets["postgres"]["user"]
-    PGPASSWORD = st.secrets["postgres"]["password"]
-else:
-    PGHOST     = os.getenv("PGHOST", "db.mhgbdxadbvrmeffljnry.supabase.co")
-    PGPORT     = int(os.getenv("PGPORT", "6543"))
-    PGDATABASE = os.getenv("PGDATABASE", "postgres")
-    PGUSER     = os.getenv("PGUSER", "postgres")
-    PGPASSWORD = os.getenv("PGPASSWORD", "")
+import psycopg2
 
-@st.cache_resource
-def get_pg_pool(minconn: int = 1, maxconn: int = 5):
-    dsn = {
-        "host": PGHOST,
-        "port": PGPORT,
-        "dbname": PGDATABASE,
-        "user": PGUSER,
-        "password": PGPASSWORD,
-        "sslmode": "require",   # Supabase requires SSL
-        "connect_timeout": 10,
-    }
-    conn_str = " ".join(f"{k}={v}" for k, v in dsn.items())
-    return psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, conn_str)
+# Direct connection test with your credentials
+print("=" * 70)
+print("Testing Direct Connection to Supabase")
+print("=" * 70)
 
-@contextmanager
-def pg_cursor():
-    pool = get_pg_pool()
-    conn = None
-    cur = None
-    try:
-        conn = pool.getconn()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        yield cur
-        conn.commit()
-    except Exception:
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            pool.putconn(conn)
+# Your connection details
+connection_params = {
+    'host': 'db.mvnvxfuiyggatlakgrbr.supabase.co',
+    'port': 5432,
+    'database': 'postgres',
+    'user': 'postgres',
+    'password': 'MeetEase@4545',
+    'sslmode': 'require'
+}
 
-# Quick test (only during development)
+print(f"\nConnecting to: {connection_params['host']}")
+print(f"Database: {connection_params['database']}")
+print(f"User: {connection_params['user']}")
+print(f"Port: {connection_params['port']}")
+print("-" * 70)
+
 try:
-    with pg_cursor() as cur:
-        cur.execute("SELECT current_database() AS db, NOW() AS ts")
-        row = cur.fetchone()
-        st.success(f"Connected to Postgres: {row['db']} (time: {row['ts']})")
-except Exception as e:
-    st.error(f"DB connection failed: {e}")
-    st.stop()
+    # Attempt connection
+    print("\n⏳ Connecting...")
+    conn = psycopg2.connect(**connection_params)
+    print("✅ Connection …
+.env
 
 
 # ------------------ UI -------------------
@@ -844,6 +816,7 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
 
 
