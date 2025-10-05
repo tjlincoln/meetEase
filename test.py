@@ -24,7 +24,14 @@ import psycopg2
 import psycopg2.extras
 import streamlit as st
 
-# --- Load from Streamlit Secrets if available (recommended for Streamlit Cloud) ---
+# postgres_conn.py (paste into your Streamlit app)
+import os
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool
+import streamlit as st
+
+# Prefer st.secrets (Streamlit Cloud). Fall back to env vars for local dev.
 if "postgres" in st.secrets:
     PGHOST     = st.secrets["postgres"]["host"]
     PGPORT     = int(st.secrets["postgres"]["port"])
@@ -32,63 +39,59 @@ if "postgres" in st.secrets:
     PGUSER     = st.secrets["postgres"]["user"]
     PGPASSWORD = st.secrets["postgres"]["password"]
 else:
-    # --- Fallback for local dev environment ---
-    PGHOST     = os.getenv("PGHOST", "aws-1-ap-southeast-1.pooler.supabase.com")
-    PGPORT     = int(os.getenv("PGPORT", "6543"))  # Connection Pooling port from Supabase
+    PGHOST     = os.getenv("PGHOST", "db.<your-project>.supabase.co")
+    PGPORT     = int(os.getenv("PGPORT", "6543"))
     PGDATABASE = os.getenv("PGDATABASE", "postgres")
     PGUSER     = os.getenv("PGUSER", "postgres")
-    PGPASSWORD = os.getenv("PGPASSWORD", "your_password_here")
+    PGPASSWORD = os.getenv("PGPASSWORD", "")
 
-# --- Database connection function ---
-def db_conn():
-    return psycopg2.connect(
-        host=PGHOST,
-        port=PGPORT,
-        dbname=PGDATABASE,
-        user=PGUSER,
-        password=PGPASSWORD,
-        sslmode="require",  # required by Supabase
-        connect_timeout=10,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
+# Create a persistent connection pool cached by Streamlit.
+# st.cache_resource ensures pool is created once per process.
+@st.cache_resource
+def get_pg_pool(minconn: int = 1, maxconn: int = 5):
+    dsn = {
+        "host": PGHOST,
+        "port": PGPORT,
+        "dbname": PGDATABASE,
+        "user": PGUSER,
+        "password": PGPASSWORD,
+        "sslmode": "require",   # Supabase requires SSL
+        "connect_timeout": 10,
+    }
+    conn_str = " ".join(f"{k}={v}" for k, v in dsn.items())
+    return psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, conn_str)
 
-# --- Optional test (you can comment this after first successful run) ---
+# Helper context manager to get a cursor (RealDictCursor returns dict rows)
+from contextlib import contextmanager
+@contextmanager
+def pg_cursor():
+    pool = get_pg_pool()
+    conn = None
+    cur = None
+    try:
+        conn = pool.getconn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        yield cur
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            pool.putconn(conn)
+
+# QUICK CONNECTION TEST (show once, useful during development)
 try:
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT current_database();")
-        st.success(f"✅ Connected to Postgres DB: {cur.fetchone()['current_database']}")
+    with pg_cursor() as cur:
+        cur.execute("SELECT current_database() as db, version() as ver")
+        r = cur.fetchone()
+        st.success(f"Connected to Postgres DB: {r['db']} — {r['ver'].splitlines()[0]}")
 except Exception as e:
-    st.error(f"❌ Database connection failed: {e}")
+    st.error(f"DB connection failed: {e}")
     st.stop()
-
-# ------------------ APP PATHS ------------------
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR,  exist_ok=True)
-
-# ------------------ OPENAI CONFIG ------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-if "general" in st.secrets and not OPENAI_API_KEY:
-    OPENAI_API_KEY = st.secrets["general"].get("OPENAI_API_KEY", "").strip()
-
-if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
-
-# ------------------ EMBEDDINGS & MODEL SETTINGS ------------------
-EMBED_MODE = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
-MINILM_MODEL_NAME = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
-OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
-OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
-
-# ------------------ WHISPER / OCR SETTINGS ------------------
-WHISPER_MODEL      = os.getenv("MEETEASE_WHISPER_MODEL", "base")
-TEMPERATURE        = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
-MAX_INPUT_TOKENS   = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
-TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
-
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ------------------ UI -------------------
@@ -845,6 +848,7 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
 
 
