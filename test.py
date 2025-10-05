@@ -1,5 +1,5 @@
 # =======================
-# MeetEase — NO-DB EDITION
+# MeetEase — NO-DB EDITION (with robust ffmpeg handling)
 # Fully local (session + JSON files), no MySQL/Postgres required
 # =======================
 from __future__ import annotations
@@ -44,6 +44,12 @@ from langchain.chains import LLMChain
 
 from pydub import AudioSegment                # audio I/O (fallback)
 from faster_whisper import WhisperModel       # fast STT
+
+# Optional, portable ffmpeg provider
+try:
+    import imageio_ffmpeg
+except Exception:
+    imageio_ffmpeg = None
 
 # =======================
 # CONFIG / ENV
@@ -267,8 +273,20 @@ def run_json(chain: Optional[LLMChain], **kwargs) -> Dict:
     return {"Context":"(LLM unavailable)", "Decisions":[], "ActionItems":[], "Risks":[]}
 
 # =======================
-# STT (FASTER-WHISPER)
+# STT (FASTER-WHISPER) + FFMPEG HANDLING
 # =======================
+def get_ffmpeg_path() -> Optional[str]:
+    """Return a working ffmpeg path or None if unavailable."""
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    if imageio_ffmpeg is not None:
+        try:
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+    return None
+
 @st.cache_resource(show_spinner=False)
 def load_whisper(model_name: str):
     device = "cuda" if (os.getenv("CUDA_VISIBLE_DEVICES") not in (None, "", "-1")) else "cpu"
@@ -291,13 +309,20 @@ def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
         pass
 
 def extract_audio_to_wav(media_path: str) -> str:
+    """Preferred: use ffmpeg (system or imageio-ffmpeg). Fallback to Pydub if absolutely needed."""
     out_wav = safe_tmp_path(".wav")
-    ff = shutil.which("ffmpeg")
+    ff = get_ffmpeg_path()
     if ff:
-        subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    else:
-        AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
+        subprocess.run(
+            [ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        return out_wav
+
+    # Final fallback (note: pydub still requires ffmpeg/ffprobe in many environments)
+    AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
     return out_wav
 
 def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
@@ -417,7 +442,6 @@ def get_latest_document_text_local(meeting_id: int) -> str:
     store = _load_store()
     docs = [d for d in store["documents"] if d["meeting_id"] == meeting_id]
     if not docs: return ""
-    # newest by created_at
     docs.sort(key=lambda d: d.get("created_at",""), reverse=True)
     return docs[0].get("text","") or ""
 
@@ -458,14 +482,12 @@ def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_
     embeddings = get_embeddings_cached()
     chunks = build_chunks(full_text)
 
-    # Try to reuse
     store_obj = faiss_load(faiss_dir, embeddings)
     bm25 = bm25_load(bm25_path)
     if store_obj and bm25:
         chunks_upsert_local(doc_id, chunks)
         return store_obj, bm25, chunks, faiss_dir, bm25_path
 
-    # Build fresh
     store_obj = FAISS.from_texts(chunks, embeddings)
     faiss_save(store_obj, faiss_dir)
     bm25 = BM25Okapi([c.split() for c in chunks])
@@ -543,7 +565,17 @@ with tab_pre:
         up = st.file_uploader("Upload a document (PDF, DOCX, or Image)", type=["pdf", "docx", "png", "jpg", "jpeg"])
         dpoints = st.text_area("Discussion points (comma-separated)", placeholder="Budget approval, Roadmap alignment, Risk review ...", height=120)
 
-        ocr_placeholder = st.empty()
+        # Diagnostics
+        with st.expander("Diagnostics"):
+            path = get_ffmpeg_path()
+            st.write("ffmpeg:", path or "(not found)")
+            if path:
+                try:
+                    out = subprocess.run([path, "-version"], capture_output=True, text=True, check=True)
+                    st.code(out.stdout.strip()[:4000])
+                except Exception as e:
+                    st.write("ffmpeg -version error:", str(e)[:300])
+
         ocr_bar = st.progress(0.0, text="Waiting for document...")
 
         if st.button("Process & Build Context", type="primary", use_container_width=True):
@@ -557,7 +589,7 @@ with tab_pre:
             raw = up.read()
             app.document_id, app.document_hash = document_get_or_create_local(app.meeting_id, up.name, up.type or "", raw)
 
-            # Extract or reuse text from local store
+            # Extract or reuse text
             store = _load_store()
             doc_rec = next((d for d in store["documents"] if d["id"] == app.document_id), None)
             text = (doc_rec or {}).get("text", "")
