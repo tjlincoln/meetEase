@@ -24,7 +24,6 @@ openai
 opencv-python
 cryptography
 pyyaml
-pyaudio
 coloredlogs
 filelock
 tqdm
@@ -34,6 +33,7 @@ moviepy
 imageio[ffmpeg]
 psycopg2-binary
 python-dotenv
+
 
 
 
