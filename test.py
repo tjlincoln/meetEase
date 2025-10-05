@@ -19,15 +19,27 @@ from datetime import date, datetime
 
 # ------------------ ENV (as requested) ------------------
 # ------------------ DB (PostgreSQL / Supabase) -------------------
+import os
 import psycopg2
 import psycopg2.extras
+import streamlit as st
 
-PGHOST     = os.getenv("PGHOST", "aws-1-ap-southeast-1.pooler.supabase.com")
-PGPORT     = int(os.getenv("PGPORT", "6543"))  # use the port shown in Supabase → Connection pooling
-PGDATABASE = os.getenv("PGDATABASE", "postgres")
-PGUSER     = os.getenv("PGUSER", "postgres")   # set your real Supabase DB user
-PGPASSWORD = os.getenv("PGPASSWORD", "")       # set your real password
+# --- Load from Streamlit Secrets if available (recommended for Streamlit Cloud) ---
+if "postgres" in st.secrets:
+    PGHOST     = st.secrets["postgres"]["host"]
+    PGPORT     = int(st.secrets["postgres"]["port"])
+    PGDATABASE = st.secrets["postgres"]["database"]
+    PGUSER     = st.secrets["postgres"]["user"]
+    PGPASSWORD = st.secrets["postgres"]["password"]
+else:
+    # --- Fallback for local dev environment ---
+    PGHOST     = os.getenv("PGHOST", "aws-1-ap-southeast-1.pooler.supabase.com")
+    PGPORT     = int(os.getenv("PGPORT", "6543"))  # Connection Pooling port from Supabase
+    PGDATABASE = os.getenv("PGDATABASE", "postgres")
+    PGUSER     = os.getenv("PGUSER", "postgres")
+    PGPASSWORD = os.getenv("PGPASSWORD", "your_password_here")
 
+# --- Database connection function ---
 def db_conn():
     return psycopg2.connect(
         host=PGHOST,
@@ -35,34 +47,49 @@ def db_conn():
         dbname=PGDATABASE,
         user=PGUSER,
         password=PGPASSWORD,
-        sslmode="require",
+        sslmode="require",  # required by Supabase
         connect_timeout=10,
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
+# --- Optional test (you can comment this after first successful run) ---
+try:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT current_database();")
+        st.success(f"✅ Connected to Postgres DB: {cur.fetchone()['current_database']}")
+except Exception as e:
+    st.error(f"❌ Database connection failed: {e}")
+    st.stop()
 
+# ------------------ APP PATHS ------------------
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
 
+# ------------------ OPENAI CONFIG ------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+if "general" in st.secrets and not OPENAI_API_KEY:
+    OPENAI_API_KEY = st.secrets["general"].get("OPENAI_API_KEY", "").strip()
+
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
 
-# Embeddings & LLM config
+# ------------------ EMBEDDINGS & MODEL SETTINGS ------------------
 EMBED_MODE = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
 MINILM_MODEL_NAME = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
 OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
 OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
 
-# Whisper / OCR config
-WHISPER_MODEL = os.getenv("MEETEASE_WHISPER_MODEL", "base")
-TEMPERATURE   = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
-MAX_INPUT_TOKENS = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
+# ------------------ WHISPER / OCR SETTINGS ------------------
+WHISPER_MODEL      = os.getenv("MEETEASE_WHISPER_MODEL", "base")
+TEMPERATURE        = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
+MAX_INPUT_TOKENS   = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
 TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
 
+import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 # ------------------ UI -------------------
 import streamlit as st
@@ -818,5 +845,6 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
 
