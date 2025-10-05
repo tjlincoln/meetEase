@@ -818,7 +818,3 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
-
-
-#jema api key rey .env haa samji gy  banav 
-# mane alag window api de  stremlit run meet.py
