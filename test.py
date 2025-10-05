@@ -18,11 +18,27 @@ from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
 # ------------------ ENV (as requested) ------------------
-MYSQL_HOST     = os.getenv("MYSQL_HOST", "aws-1-ap-southeast-1.pooler.supabase.com")
-MYSQL_USER     = os.getenv("MYSQL_USER", "Success. No rows returned")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Tirth@123")
-port=6543
-MYSQL_DB       = os.getenv("MYSQL_DB", "postgres")
+# ------------------ DB (PostgreSQL / Supabase) -------------------
+import psycopg2
+import psycopg2.extras
+
+PGHOST     = os.getenv("PGHOST", "aws-1-ap-southeast-1.pooler.supabase.com")
+PGPORT     = int(os.getenv("PGPORT", "6543"))  # use the port shown in Supabase → Connection pooling
+PGDATABASE = os.getenv("PGDATABASE", "postgres")
+PGUSER     = os.getenv("PGUSER", "postgres")   # set your real Supabase DB user
+PGPASSWORD = os.getenv("PGPASSWORD", "")       # set your real password
+
+def db_conn():
+    return psycopg2.connect(
+        host=PGHOST,
+        port=PGPORT,
+        dbname=PGDATABASE,
+        user=PGUSER,
+        password=PGPASSWORD,
+        sslmode="require",
+        connect_timeout=10,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
 
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
@@ -802,4 +818,5 @@ if not OPENAI_API_KEY:
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
+
 
