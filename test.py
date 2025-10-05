@@ -1,14 +1,12 @@
-# MeetEase — FAST version (optimized)
-# -------------------------------------------------------------
-# Key improvements:
-# - Switch to faster-whisper (CTranslate2) for 2–10× faster STT on CPU/GPU
-# - Replace MoviePy with direct ffmpeg extraction (much faster & safer)
-# - Aggressive caching for embeddings, tokenizers, splitters, and extracted text
-# - Skip re-embedding when document+settings unchanged (settings hash includes doc_hash)
-# - Smarter PDF OCR: only OCR low-text pages; lower DPI to 200
-# - Larger chunk size to reduce chunk count (1400/160 overlap)
-# - DB index suggestions (keep in README / migrations)
-# -------------------------------------------------------------
+# app.py — MeetEase (FAST, single-file, no .env, no DDL)
+# --------------------------------------------------------------------------------------
+# - Assumes DB tables already exist (no CREATE TABLE here).
+# - Direct Postgres (Supabase) via psycopg2 with SSL.
+# - PDF/DOCX/Image ingestion + OCR (PyMuPDF + Tesseract).
+# - FAISS + BM25 indices cached on disk.
+# - faster-whisper transcription with ffmpeg or pydub fallback.
+# - Agenda & Summary via OpenAI (optional; graceful fallback if no key).
+# --------------------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -16,39 +14,42 @@ import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, g
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-
-# ------------------ ENV (as requested) ------------------
-# Supabase PostgreSQL Configuration
+# ----------------- INLINE CONFIG (edit these if needed) -----------------
+# Supabase (Direct connection). You can also override via env vars.
 SUPABASE_HOST     = os.getenv("SUPABASE_HOST", "db.mvnvxfuiyggatlakgrbr.supabase.co")
-SUPABASE_PORT     = os.getenv("SUPABASE_PORT", "5432")
+SUPABASE_PORT     = int(os.getenv("SUPABASE_PORT", "5432"))
+SUPABASE_DB       = os.getenv("SUPABASE_DATABASE", "postgres")
 SUPABASE_USER     = os.getenv("SUPABASE_USER", "postgres")
 SUPABASE_PASSWORD = os.getenv("SUPABASE_PASSWORD", "MeetEase@4545")
-SUPABASE_DB       = os.getenv("SUPABASE_DATABASE", "postgres")
+
+# Optional: Switch to pooler if you hit IPv6 issues / connection limits
+# SUPABASE_HOST = os.getenv("SUPABASE_HOST", "aws-1-ap-southeast-1.pooler.supabase.com")
+# SUPABASE_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
+# SUPABASE_USER = os.getenv("SUPABASE_USER", "postgres.mvnvxfuiyggatlakgrbr")
+
+# OpenAI (optional; app runs fine without it)
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()  # paste your key if you want LLM features
+OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
+
+# Embeddings (HF default keeps things local-friendly)
+EMBED_MODE         = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
+MINILM_MODEL_NAME  = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
+
+# Whisper / OCR / Tokenization
+WHISPER_MODEL      = os.getenv("MEETEASE_WHISPER_MODEL", "base")
+TEMPERATURE        = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
+MAX_INPUT_TOKENS   = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
+TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR,  exist_ok=True)
-# chalse k env ma nakhvu pdse?
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # for langchain_openai
-
-# Embeddings & LLM config
-EMBED_MODE = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # 'minilm' | 'openai'
-MINILM_MODEL_NAME = os.getenv("MEETEASE_MINILM", "sentence-transformers/all-MiniLM-L6-v2")
-OPENAI_EMBED_MODEL = os.getenv("MEETEASE_OPENAI_EMBED_MODEL", "text-embedding-3-small")
-OPENAI_MODEL       = os.getenv("MEETEASE_OPENAI_MODEL", "gpt-4o-mini")
-
-# Whisper / OCR config
-WHISPER_MODEL = os.getenv("MEETEASE_WHISPER_MODEL", "base")
-TEMPERATURE   = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
-MAX_INPUT_TOKENS = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "3000"))
-TESSERACT_PATH_WIN = os.getenv("MEETEASE_TESSERACT_PATH", "")
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # used by langchain_openai
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -82,14 +83,16 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 def db_conn():
+    # psycopg2 accepts dbname or database; we use dbname for clarity
     return psycopg2.connect(
-        host=SUPABASE_HOST, 
+        host=SUPABASE_HOST,
         port=SUPABASE_PORT,
-        user=SUPABASE_USER, 
+        user=SUPABASE_USER,
         password=SUPABASE_PASSWORD,
-        database=SUPABASE_DB,
-        sslmode='require',  # Supabase requires SSL
-        cursor_factory=RealDictCursor
+        dbname=SUPABASE_DB,
+        sslmode="require",
+        cursor_factory=RealDictCursor,
+        connect_timeout=10,
     )
 
 # ---------------- OCR / FILES ------------
@@ -172,16 +175,15 @@ def pil_ocr(img_bgr: np.ndarray) -> str:
 def cached_extract_pdf_text(doc_hash: str, pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
-    total = doc.page_count or 1
     for i in range(doc.page_count):
         pg = doc.load_page(i)
         raw = pg.get_text("text").strip()
-        if len(raw) < 80:  # only OCR low-text pages
-            pix = pg.get_pixmap(dpi=200)  # reduced DPI for speed
+        if len(raw) < 80:
+            pix = pg.get_pixmap(dpi=200)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             proc = preprocess_for_ocr(bgr)
-            raw = pil_ocr(proc)
+            raw = pytesseract.image_to_string(Image.fromarray(proc))
         out.append(raw)
     return "\n".join(out)
 
@@ -201,27 +203,28 @@ def cached_extract_image_text(doc_hash: str, img_bytes: bytes) -> str:
     return raw
 
 # ------------- LLM / Prompts -------------
-import tiktoken  # still imported so cache can resolve
+import tiktoken  # for token cache
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 
 AGENDA_PROMPT = PromptTemplate(
-      input_variables=["discussion_points", "context"],
-        template=(
-            "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
-            "Discussion points:\n{discussion_points}\n\n"
-            "Relevant context (from docs):\n{context}\n\n"
-            "Return a professional agenda with sections, timings (optional), and logical flow."
-        ),
+    input_variables=["discussion_points", "context"],
+    template=(
+        "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
+        "Discussion points:\n{discussion_points}\n\n"
+        "Relevant context (from docs):\n{context}\n\n"
+        "Return a professional agenda with clear sections and a logical flow."
+    ),
 )
 SUMMARY_PROMPT_JSON = PromptTemplate(
-        input_variables=["ctx", "transcript", "query"],
-        template=(
-            "Using the context and transcript, produce a crisp post-meeting summary with:\n"
-            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items with Owners & due dates when stated\n\n"
-            "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
-        ),
+    input_variables=["ctx", "transcript", "query"],
+    template=(
+        "Using the context and transcript, produce a crisp post-meeting summary with:\n"
+        "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items (owner & due date if stated)\n\n"
+        "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
+        "Return JSON with keys: topics, decisions, action_items."
+    ),
 )
 
 @st.cache_resource(show_spinner=False)
@@ -243,7 +246,8 @@ def run_json(chain: Optional[LLMChain], **kwargs) -> Dict:
             return json.loads(m.group(0))
         except Exception:
             pass
-    return {"Context":"(LLM unavailable)", "Decisions":[], "ActionItems":[], "Risks":[]}
+    # Fallback heuristic JSON
+    return {"topics": [], "decisions": [], "action_items": []}
 
 def dedupe_lines(text: str) -> str:
     seen, out = set(), []
@@ -262,8 +266,6 @@ def load_whisper(model_name: str):
     device = "cuda" if (os.getenv("CUDA_VISIBLE_DEVICES") not in (None, "", "-1")) else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
     return WhisperModel(model_name, device=device, compute_type=compute_type)
-
-# Windows-safe temp helpers
 
 def safe_tmp_path(suffix=".wav") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -285,8 +287,6 @@ def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
     except Exception:
         pass
 
-# Fast audio extraction using ffmpeg or pydub fallback
-
 def extract_audio_to_wav(media_path: str) -> str:
     out_wav = safe_tmp_path(".wav")
     ff = shutil.which("ffmpeg")
@@ -294,18 +294,8 @@ def extract_audio_to_wav(media_path: str) -> str:
         subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     else:
-        # Fallback if ffmpeg not found
         AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
     return out_wav
-
-# Optional light filter (kept simple for speed)
-def spectral_gate(seg: AudioSegment) -> AudioSegment:
-    try:
-        return seg.high_pass_filter(80).low_pass_filter(8000)
-    except Exception:
-        return seg
-
-# Single-pass transcription with built-in VAD
 
 def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
     model = load_whisper(WHISPER_MODEL)
@@ -327,7 +317,6 @@ def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
     return dedupe_lines(final)
 
 # --------------- DB HELPERS --------------
-
 def meeting_get_or_create(title: str, mdate: date) -> int:
     conn = db_conn()
     try:
@@ -336,8 +325,9 @@ def meeting_get_or_create(title: str, mdate: date) -> int:
             row = cur.fetchone()
             if row: return row["id"]
             cur.execute("INSERT INTO meetings (title, meeting_date) VALUES (%s, %s) RETURNING id", (title, mdate))
+            new_id = cur.fetchone()["id"]
             conn.commit()
-            return cur.fetchone()["id"]
+            return new_id
     finally:
         conn.close()
 
@@ -353,8 +343,9 @@ def document_get_or_create(meeting_id: int, name: str, mime: str, content: bytes
                 "INSERT INTO documents (meeting_id, name, mime, hash_key) VALUES (%s,%s,%s,%s) RETURNING id",
                 (meeting_id, name, mime, h)
             )
+            new_id = cur.fetchone()["id"]
             conn.commit()
-            return cur.fetchone()["id"], h
+            return new_id, h
     finally:
         conn.close()
 
@@ -446,7 +437,6 @@ def summary_insert(meeting_id: int, query_text: str, summary_json: Dict):
         conn.close()
 
 # ------------ RAG helpers ------------
-
 def faiss_save(store: FAISS, path_dir: str):
     os.makedirs(path_dir, exist_ok=True)
     store.save_local(path_dir)
@@ -467,8 +457,6 @@ def bm25_load(path_file: str) -> Optional[BM25Okapi]:
     if not os.path.isfile(path_file): return None
     with open(path_file, "rb") as f:
         return pickle.load(f)
-
-# Build or load indices quickly; settings include doc_hash to avoid rebuilds when unchanged
 
 def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict) -> Tuple[FAISS, BM25Okapi, List[str], str, str]:
     s_hash = settings_hash({
@@ -496,10 +484,11 @@ def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_
     bm25 = BM25Okapi([c.split() for c in chunks])
     bm25_save(bm25, bm25_path)
     chunks_upsert(doc_id, chunks)
-    indices_upsert(doc_id, doc_hash, bm25_path, faiss_dir,
-                   ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME))
+    indices_upsert(
+        doc_id, doc_hash, bm25_path, faiss_dir,
+        ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME)
+    )
     return store, bm25, chunks, faiss_dir, bm25_path
-
 
 def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Optional[BM25Okapi], Optional[List[str]]]:
     rec = indices_get(doc_id)
@@ -508,7 +497,6 @@ def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Option
     store = faiss_load(rec.get("embed_index_path",""), embeddings)
     bm25  = bm25_load(rec.get("bm25_path","")) if rec.get("bm25_path") else None
     return store, bm25, None
-
 
 def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
     ctx = ""
@@ -525,8 +513,6 @@ def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: Li
         ctx = "\n\n".join(chunks[i] for i in top_idx)
     return ctx
 
-# ---------- Agenda Resolution ----------
-
 def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tuple[List[str], List[str]]:
     t = (transcript or "").lower()
     resolved_kw = ["resolved", "completed", "closed", "fixed", "agreed"]
@@ -540,22 +526,20 @@ def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tupl
             if any(k in window for k in resolved_kw): resolved.append(p)
             elif any(k in window for k in unresolved_kw): unresolved.append(p)
             else: unresolved.append(p)
-        else: unresolved.append(p)
+        else:
+            unresolved.append(p)
     return resolved, unresolved
 
 # --------------- Quality CSV ------------
 METRICS_CSV = os.path.join(CACHE_DIR, "quality_metrics.csv")
-
 def metrics_csv_init():
     if not os.path.isfile(METRICS_CSV):
         with open(METRICS_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow(["ts","meeting_id","ocr_hit_proxy","stt_wer","usefulness"])
-
+            csv.writer(f).writerow(["ts","meeting_id","ocr_hit_proxy","stt_wer","usefulness"])
 def metrics_csv_append(meeting_id: int, ocr_hit_proxy: Optional[float], stt_wer: Optional[float], usefulness: Optional[float]):
     metrics_csv_init()
     with open(METRICS_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([datetime.utcnow().isoformat(), meeting_id, ocr_hit_proxy, stt_wer, usefulness])
+        csv.writer(f).writerow([datetime.utcnow().isoformat(), meeting_id, ocr_hit_proxy, stt_wer, usefulness])
 
 # --------------- UI STATE ---------------
 @dataclass
@@ -576,7 +560,7 @@ app: AppState = st.session_state.app
 
 # ----------------- TABS ------------------
 tab_pre, tab_agenda, tab_track, tab_summary = st.tabs(
-    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary",]
+    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary"]
 )
 
 # -------- PRE-MEETING TAB --------
@@ -590,7 +574,6 @@ with tab_pre:
         up = st.file_uploader("Upload a document (PDF, DOCX, or Image)", type=["pdf", "docx", "png", "jpg", "jpeg"])
         dpoints = st.text_area("Discussion points (comma-separated)", placeholder="Budget approval, Roadmap alignment, Risk review ...", height=120)
 
-        ocr_placeholder = st.empty()
         ocr_bar = st.progress(0.0, text="Waiting for document...")
 
         if st.button("Process & Build Context", type="primary", use_container_width=True):
@@ -604,8 +587,7 @@ with tab_pre:
             raw = up.read()
             app.document_id, app.document_hash = document_get_or_create(app.meeting_id, up.name, up.type or "", raw)
 
-            # Extract or reuse text (cached by doc hash)
-            text = None
+            # Extract or reuse cached text from DB
             conn = db_conn()
             with conn.cursor() as cur:
                 cur.execute("SELECT text FROM documents WHERE id=%s", (app.document_id,))
@@ -635,7 +617,7 @@ with tab_pre:
 
             app.last_doc_text = text
 
-            # Build or load indices with settings-hash
+            # Build or load indices
             st.info("Building / loading indices...")
             splitter_conf = {"chunk_size":1400, "overlap":160}
             app.faiss_store, app.bm25, app.chunks, _, _ = build_and_persist_indices(
@@ -705,7 +687,6 @@ with tab_track:
                     tmp_v.write(v.getbuffer())
                     media_path = tmp_v.name
 
-                # Extract audio fast
                 audio_path = extract_audio_to_wav(media_path)
                 safe_unlink(media_path)
 
@@ -746,9 +727,11 @@ with tab_summary:
         st.warning("Please complete **Pre-Meeting** so RAG context is available.")
     else:
         v2 = st.file_uploader("Upload meeting media (optional)", type=["mp4","mov","avi","wav","mp3","m4a"], key="post_vid")
-        query = st.text_input("Focus query",
-                              value="Key discussion topics, decisions made, action items with owners",
-                              help="What do you want the summary to emphasize?")
+        query = st.text_input(
+            "Focus query",
+            value="Key discussion topics, decisions made, action items with owners",
+            help="What do you want the summary to emphasize?"
+        )
 
         if st.button("Generate Summary", type="primary", use_container_width=True):
             transcript = app.last_transcript or ""
@@ -789,33 +772,25 @@ with tab_summary:
                 ctx = select_context(app.faiss_store, app.bm25, app.chunks or [], q, k=4)
                 llm = maybe_llm(max_tokens=450, temperature=TEMPERATURE)
                 chain = LLMChain(prompt=SUMMARY_PROMPT_JSON, llm=llm) if llm else None
-                obj = run_json(chain,
-                               ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
-                               transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
-                               query=query)
+                obj = run_json(
+                    chain,
+                    ctx=truncate_tokens(ctx, MAX_INPUT_TOKENS//2),
+                    transcript=truncate_tokens(transcript, MAX_INPUT_TOKENS//2),
+                    query=query
+                )
 
                 summary_insert(app.meeting_id, query, obj)
 
                 st.markdown("### Summary (JSON)")
                 st.code(json.dumps(obj, indent=2))
-                st.download_button("Download Summary (JSON)",
-                                   data=json.dumps(obj, indent=2).encode("utf-8"),
-                                   file_name="post_meeting_summary.json",
-                                   mime="application/json",
-                                   use_container_width=True)
+                st.download_button(
+                    "Download Summary (JSON)",
+                    data=json.dumps(obj, indent=2).encode("utf-8"),
+                    file_name="post_meeting_summary.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
 
-# -------- METRICS & EXPORT TAB ----------
-
-
-# ======= FINAL NOTE =======
+# -------- NOTES ----------
 if not OPENAI_API_KEY:
-    st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
-
-# === DB INDEX SUGGESTIONS (run once in your DB) ===
-# CREATE INDEX idx_meetings_title_date ON meetings (title, meeting_date);
-# CREATE UNIQUE INDEX idx_documents_meeting_hash ON documents (meeting_id, hash_key);
-# CREATE INDEX idx_doc_chunks_doc ON doc_chunks (document_id, chunk_index);
-# CREATE INDEX idx_indices_doc ON indices (document_id);
-# CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
-# CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
-
+    st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks. Embeddings default to MiniLM (CPU).")
