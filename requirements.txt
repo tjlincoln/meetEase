@@ -21,6 +21,7 @@ tiktoken
 faster-whisper
 pydub
 openai
+opencv-python
 cryptography
 pyyaml
 pyaudio
@@ -33,6 +34,7 @@ moviepy
 imageio[ffmpeg]
 psycopg2-binary
 python-dotenv
+
 
 
 
