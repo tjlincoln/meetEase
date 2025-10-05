@@ -1,111 +1,80 @@
-# MeetEase — FAST version (optimized)
-# -------------------------------------------------------------
-# Key improvements:
-# - Switch to faster-whisper (CTranslate2) for 2–10× faster STT on CPU/GPU
-# - Replace MoviePy with direct ffmpeg extraction (much faster & safer)
-# - Aggressive caching for embeddings, tokenizers, splitters, and extracted text
-# - Skip re-embedding when document+settings unchanged (settings hash includes doc_hash)
-# - Smarter PDF OCR: only OCR low-text pages; lower DPI to 200
-# - Larger chunk size to reduce chunk count (1400/160 overlap)
-# - DB index suggestions (keep in README / migrations)
-# -------------------------------------------------------------
-
+# =======================
+# ALL IMPORTS (TOP ONLY)
+# =======================
 from __future__ import annotations
 
-import os, io, re, csv, json, time, math, pickle, hashlib, tempfile, warnings, gc, subprocess, shutil
+# stdlib
+import os
+import io
+import re
+import csv
+import json
+import time
+import math
+import gc
+import hashlib
+import tempfile
+import subprocess
+import shutil
+import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
 
+# third-party
+import streamlit as st                       # UI
+import psycopg2                              # Supabase/Postgres driver
+import psycopg2.extras as pg_extras          # RealDictCursor
 
-import psycopg2
+from PIL import Image                        # OCR helpers
+import numpy as np
+import pytesseract
+import fitz                                   # PyMuPDF
+import docx                                   # python-docx
+import cv2
 
-# Direct connection test with your credentials
-print("=" * 70)
-print("Testing Direct Connection to Supabase")
-print("=" * 70)
+import tiktoken                               # token counting
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from rank_bm25 import BM25Okapi
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
 
-# Your connection details
-connection_params = {
-    'host': 'db.mvnvxfuiyggatlakgrbr.supabase.co',
-    'port': 5432,
-    'database': 'postgres',
-    'user': 'postgres',
-    'password': 'MeetEase@4545',
-    'sslmode': 'require'
-}
+from pydub import AudioSegment                # audio I/O (fallback)
+from faster_whisper import WhisperModel       # fast STT
 
-print(f"\nConnecting to: {connection_params['host']}")
-print(f"Database: {connection_params['database']}")
-print(f"User: {connection_params['user']}")
-print(f"Port: {connection_params['port']}")
-print("-" * 70)
+# =======================
+# CONFIG / ENV
+# =======================
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_EMBED_MODEL   = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+EMBED_MODE           = os.getenv("MEETEASE_EMBED_MODE", "minilm").lower()  # "minilm" or "openai"
+MINILM_MODEL_NAME    = os.getenv("MINILM_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+TEMPERATURE          = float(os.getenv("MEETEASE_TEMPERATURE", "0.2"))
+MAX_INPUT_TOKENS     = int(os.getenv("MEETEASE_MAX_INPUT_TOKENS", "6000"))
 
-try:
-    # Attempt connection
-    print("\n⏳ Connecting...")
-    conn = psycopg2.connect(**connection_params)
-    print("✅ Connection successful!")
-    
-    # Test query
-    cursor = conn.cursor()
-    cursor.execute("SELECT version();")
-    version = cursor.fetchone()
-    print(f"\n📊 PostgreSQL Version:")
-    print(f"   {version[0]}")
-    
-    # List databases
-    cursor.execute("""
-        SELECT datname FROM pg_database 
-        WHERE datistemplate = false 
-        ORDER BY datname;
-    """)
-    databases = cursor.fetchall()
-    print(f"\n📁 Available Databases:")
-    for db in databases:
-        print(f"   • {db[0]}")
-    
-    # List tables
-    cursor.execute("""
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public'
-        ORDER BY table_name;
-    """)
-    tables = cursor.fetchall()
-    
-    print(f"\n📋 Tables in 'public' schema:")
-    if tables:
-        for table in tables:
-            print(f"   • {table[0]}")
-    else:
-        print("   (No tables found - run setup_database.py to create them)")
-    
-    cursor.close()
-    conn.close()
-    
-    print("\n" + "=" * 70)
-    print("✅ CONNECTION TEST SUCCESSFUL!")
-    print("=" * 70)
-    print("\nYou can now run:")
-    print("  1. python setup_database.py  (to create tables)")
-    print("  2. python db_operations.py   (to test CRUD operations)")
-    
-except psycopg2.Error as e:
-    print(f"\n❌ Connection Error: {e}")
-    print("\n🔍 Troubleshooting:")
-    print("  1. Verify your Supabase project is active")
-    print("  2. Check if the hostname is correct in Supabase dashboard")
-    print("  3. Verify password: Meet.cool8")
-    print("  4. Check if your IP is allowed (Supabase -> Settings -> Database)")
-    print("  5. Verify pooler is enabled in Supabase")
-    
-except Exception as e:
-    print(f"\n❌ Unexpected Error: {e}")
+WHISPER_MODEL        = os.getenv("WHISPER_MODEL", "medium")
+TESSERACT_PATH_WIN   = os.getenv("TESSERACT_PATH_WIN", "")
 
-print("\n" + "=" * 70)
-# ------------------ UI -------------------
-import streamlit as st
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR,  exist_ok=True)
+
+# Supabase / Postgres envs (set these in your environment/dashboard)
+PG_HOST     = os.getenv("PGHOST",     "db.mvnvxfuiyggatlakgrbr.supabase.co")
+PG_PORT     = int(os.getenv("PGPORT", "5432"))
+PG_DB       = os.getenv("PGDATABASE", "postgres")
+PG_USER     = os.getenv("PGUSER",     "postgres")
+PG_PASSWORD = os.getenv("PGPASSWORD", "MeetEase@4545")
+PG_SSLMODE  = os.getenv("PGSSLMODE",  "require")
+
+# =======================
+# STREAMLIT UI SHELL
+# =======================
 st.set_page_config(page_title="MeetEase — Meeting Management", page_icon="🎯", layout="wide")
 st.markdown("""
 <style>
@@ -124,30 +93,28 @@ textarea {border-radius: 10px !important;}
 .codebox {font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
 </style>
 """, unsafe_allow_html=True)
-
 st.markdown('<div class="big-title">🤖 MeetEase — Meeting Management</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtle">Prepare, run, and summarize meetings with AI assistance.</div>', unsafe_allow_html=True)
 st.write("")
 
-# ------------------ DB -------------------
-import pymysql
-pymysql.install_as_MySQLdb()
-
+# =======================
+# DB (Supabase/Postgres)
+# =======================
 def db_conn():
-    return pymysql.connect(
-        host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASSWORD,
-        database=MYSQL_DB, charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor, autocommit=True
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        sslmode=PG_SSLMODE,
     )
+    conn.autocommit = True
+    return conn
 
-# ---------------- OCR / FILES ------------
-from PIL import Image
-import numpy as np
-import pytesseract
-import fitz  # PyMuPDF
-import docx
-import cv2
-
+# =======================
+# OCR / FILE EXTRACTORS
+# =======================
 if TESSERACT_PATH_WIN:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH_WIN
 
@@ -158,7 +125,6 @@ def settings_hash(d: Dict) -> str:
     s = json.dumps(d, sort_keys=True)
     return hashlib.sha256(s.encode()).hexdigest()
 
-# -------------- CACHES -------------------
 @st.cache_resource(show_spinner=False)
 def token_encoder_cached():
     import tiktoken
@@ -170,21 +136,11 @@ def truncate_tokens(text: str, max_tokens: int) -> str:
     ids = enc.encode(text or "")
     return enc.decode(ids[:max_tokens])
 
-# -------- Embeddings / FAISS / BM25 -----
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from rank_bm25 import BM25Okapi
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
 @st.cache_resource(show_spinner=False)
 def get_embeddings_cached():
     if EMBED_MODE == "openai" and OPENAI_API_KEY:
         return OpenAIEmbeddings(model=OPENAI_EMBED_MODEL)
-    return HuggingFaceEmbeddings(
-        model_name=MINILM_MODEL_NAME,
-        encode_kwargs={"normalize_embeddings": True}
-    )
+    return HuggingFaceEmbeddings(model_name=MINILM_MODEL_NAME, encode_kwargs={"normalize_embeddings": True})
 
 @st.cache_resource(show_spinner=False)
 def get_splitter():
@@ -195,7 +151,6 @@ def build_chunks(text: str) -> List[str]:
     chunks = splitter.split_text(text or "")
     return chunks if chunks else [text or ""]
 
-# ---------- OCR helpers (fast) -----------
 def preprocess_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3,3), 0)
@@ -220,12 +175,11 @@ def pil_ocr(img_bgr: np.ndarray) -> str:
 def cached_extract_pdf_text(doc_hash: str, pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
-    total = doc.page_count or 1
     for i in range(doc.page_count):
         pg = doc.load_page(i)
         raw = pg.get_text("text").strip()
-        if len(raw) < 80:  # only OCR low-text pages
-            pix = pg.get_pixmap(dpi=200)  # reduced DPI for speed
+        if len(raw) < 80:
+            pix = pg.get_pixmap(dpi=200)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             proc = preprocess_for_ocr(bgr)
@@ -248,32 +202,38 @@ def cached_extract_image_text(doc_hash: str, img_bytes: bytes) -> str:
         raw = pytesseract.image_to_string(Image.fromarray(proc))
     return raw
 
-# ------------- LLM / Prompts -------------
-import tiktoken  # still imported so cache can resolve
-from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+# =======================
+# LLM / PROMPTS
+# =======================
+def dedupe_lines(text: str) -> str:
+    seen, out = set(), []
+    for line in [l.strip() for l in (text or "").splitlines() if l.strip()]:
+        key = re.sub(r"\W+","", line.lower())
+        if key in seen: continue
+        seen.add(key); out.append(line)
+    return "\n".join(out)
 
 AGENDA_PROMPT = PromptTemplate(
-      input_variables=["discussion_points", "context"],
-        template=(
-            "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
-            "Discussion points:\n{discussion_points}\n\n"
-            "Relevant context (from docs):\n{context}\n\n"
-            "Return a professional agenda with sections, timings (optional), and logical flow."
-        ),
+    input_variables=["discussion_points", "context"],
+    template=(
+        "You are a project coordinator. Create a concise, well-structured meeting agenda.\n\n"
+        "Discussion points:\n{discussion_points}\n\n"
+        "Relevant context (from docs):\n{context}\n\n"
+        "Return a professional agenda with sections, timings (optional), and logical flow."
+    ),
 )
+
 SUMMARY_PROMPT_JSON = PromptTemplate(
-        input_variables=["ctx", "transcript", "query"],
-        template=(
-            "Using the context and transcript, produce a crisp post-meeting summary with:\n"
-            "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items with Owners & due dates when stated\n\n"
-            "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
-        ),
+    input_variables=["ctx", "transcript", "query"],
+    template=(
+        "Using the context and transcript, produce a crisp post-meeting summary with:\n"
+        "1) Key Discussion Topics\n2) Decisions Made\n3) Action Items with Owners & due dates when stated\n\n"
+        "Context:\n{ctx}\n\nTranscript:\n{transcript}\n\nQuery:\n{query}\n"
+    ),
 )
 
 @st.cache_resource(show_spinner=False)
-def maybe_llm(max_tokens=400, temperature=TEMPERATURE):
+def maybe_llm(max_tokens=400, temperature=0.2):
     if not OPENAI_API_KEY:
         return None
     return ChatOpenAI(model=OPENAI_MODEL, temperature=temperature, max_tokens=max_tokens)
@@ -293,47 +253,29 @@ def run_json(chain: Optional[LLMChain], **kwargs) -> Dict:
             pass
     return {"Context":"(LLM unavailable)", "Decisions":[], "ActionItems":[], "Risks":[]}
 
-def dedupe_lines(text: str) -> str:
-    seen, out = set(), []
-    for line in [l.strip() for l in (text or "").splitlines() if l.strip()]:
-        key = re.sub(r"\W+","", line.lower())
-        if key in seen: continue
-        seen.add(key); out.append(line)
-    return "\n".join(out)
-
-# ------------------ STT (FAST) ------------------
-from pydub import AudioSegment
-from faster_whisper import WhisperModel
-
+# =======================
+# STT (FASTER-WHISPER)
+# =======================
 @st.cache_resource(show_spinner=False)
 def load_whisper(model_name: str):
     device = "cuda" if (os.getenv("CUDA_VISIBLE_DEVICES") not in (None, "", "-1")) else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
     return WhisperModel(model_name, device=device, compute_type=compute_type)
 
-# Windows-safe temp helpers
-
 def safe_tmp_path(suffix=".wav") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    return path
+    fd, path = tempfile.mkstemp(suffix=suffix); os.close(fd); return path
 
 def safe_unlink(path: str, max_tries: int = 6, wait_s: float = 0.25):
     for i in range(max_tries):
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(path): os.remove(path)
             return
         except PermissionError:
-            time.sleep(wait_s * (i + 1))
-            gc.collect()
+            time.sleep(wait_s * (i + 1)); gc.collect()
     try:
-        if os.path.exists(path):
-            os.remove(path)
+        if os.path.exists(path): os.remove(path)
     except Exception:
         pass
-
-# Fast audio extraction using ffmpeg or pydub fallback
 
 def extract_audio_to_wav(media_path: str) -> str:
     out_wav = safe_tmp_path(".wav")
@@ -342,18 +284,8 @@ def extract_audio_to_wav(media_path: str) -> str:
         subprocess.run([ff, "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_wav],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     else:
-        # Fallback if ffmpeg not found
         AudioSegment.from_file(media_path).set_frame_rate(16000).set_channels(1).export(out_wav, format="wav")
     return out_wav
-
-# Optional light filter (kept simple for speed)
-def spectral_gate(seg: AudioSegment) -> AudioSegment:
-    try:
-        return seg.high_pass_filter(80).low_pass_filter(8000)
-    except Exception:
-        return seg
-
-# Single-pass transcription with built-in VAD
 
 def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
     model = load_whisper(WHISPER_MODEL)
@@ -374,17 +306,18 @@ def transcribe_long_audio(audio_path: str, progress_cb=None) -> str:
     final = re.sub(r"\s+", " ", final).strip()
     return dedupe_lines(final)
 
-# --------------- DB HELPERS --------------
-
+# =======================
+# DB HELPERS (Supabase)
+# =======================
 def meeting_get_or_create(title: str, mdate: date) -> int:
     conn = db_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
             cur.execute("SELECT id FROM meetings WHERE title=%s AND meeting_date=%s", (title, mdate))
             row = cur.fetchone()
             if row: return row["id"]
-            cur.execute("INSERT INTO meetings (title, meeting_date) VALUES (%s, %s)", (title, mdate))
-            return cur.lastrowid
+            cur.execute("INSERT INTO meetings (title, meeting_date) VALUES (%s, %s) RETURNING id", (title, mdate))
+            return cur.fetchone()["id"]
     finally:
         conn.close()
 
@@ -392,15 +325,15 @@ def document_get_or_create(meeting_id: int, name: str, mime: str, content: bytes
     h = sha256_bytes(content)
     conn = db_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
             cur.execute("SELECT id FROM documents WHERE hash_key=%s AND meeting_id=%s", (h, meeting_id))
             r = cur.fetchone()
             if r: return r["id"], h
             cur.execute(
-                "INSERT INTO documents (meeting_id, name, mime, hash_key) VALUES (%s,%s,%s,%s)",
+                "INSERT INTO documents (meeting_id, name, mime, hash_key) VALUES (%s,%s,%s,%s) RETURNING id",
                 (meeting_id, name, mime, h)
             )
-            return cur.lastrowid, h
+            return cur.fetchone()["id"], h
     finally:
         conn.close()
 
@@ -429,7 +362,7 @@ def chunks_upsert(doc_id: int, chunks: List[str]):
 def indices_get(doc_id: int):
     conn = db_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM indices WHERE document_id=%s", (doc_id,))
             return cur.fetchone()
     finally:
@@ -438,7 +371,7 @@ def indices_get(doc_id: int):
 def indices_upsert(doc_id: int, doc_hash: str, bm25_path: str, embed_index_path: str, embed_model: str):
     conn = db_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
             cur.execute("SELECT id FROM indices WHERE document_id=%s", (doc_id,))
             row = cur.fetchone()
             if row:
@@ -465,7 +398,7 @@ def agenda_insert(meeting_id: int, agenda_text: str):
 def transcript_upsert(meeting_id: int, audio_hash: str, transcript_text: str):
     conn = db_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
             cur.execute("SELECT id FROM transcripts WHERE meeting_id=%s AND audio_hash=%s", (meeting_id, audio_hash))
             r = cur.fetchone()
             if r:
@@ -485,8 +418,9 @@ def summary_insert(meeting_id: int, query_text: str, summary_json: Dict):
     finally:
         conn.close()
 
-# ------------ RAG helpers ------------
-
+# =======================
+# RAG HELPERS
+# =======================
 def faiss_save(store: FAISS, path_dir: str):
     os.makedirs(path_dir, exist_ok=True)
     store.save_local(path_dir)
@@ -507,8 +441,6 @@ def bm25_load(path_file: str) -> Optional[BM25Okapi]:
     if not os.path.isfile(path_file): return None
     with open(path_file, "rb") as f:
         return pickle.load(f)
-
-# Build or load indices quickly; settings include doc_hash to avoid rebuilds when unchanged
 
 def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_mode: str, splitter_conf: Dict) -> Tuple[FAISS, BM25Okapi, List[str], str, str]:
     s_hash = settings_hash({
@@ -540,7 +472,6 @@ def build_and_persist_indices(doc_id: int, doc_hash: str, full_text: str, embed_
                    ("openai:"+OPENAI_EMBED_MODEL) if EMBED_MODE=="openai" else ("hf:"+MINILM_MODEL_NAME))
     return store, bm25, chunks, faiss_dir, bm25_path
 
-
 def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Optional[BM25Okapi], Optional[List[str]]]:
     rec = indices_get(doc_id)
     if not rec: return None, None, None
@@ -548,7 +479,6 @@ def try_load_indices_with_settings(doc_id: int) -> Tuple[Optional[FAISS], Option
     store = faiss_load(rec.get("embed_index_path",""), embeddings)
     bm25  = bm25_load(rec.get("bm25_path","")) if rec.get("bm25_path") else None
     return store, bm25, None
-
 
 def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: List[str], query: str, k:int=4) -> str:
     ctx = ""
@@ -565,8 +495,9 @@ def select_context(store: Optional[FAISS], bm25: Optional[BM25Okapi], chunks: Li
         ctx = "\n\n".join(chunks[i] for i in top_idx)
     return ctx
 
-# ---------- Agenda Resolution ----------
-
+# =======================
+# AGENDA RESOLUTION
+# =======================
 def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tuple[List[str], List[str]]:
     t = (transcript or "").lower()
     resolved_kw = ["resolved", "completed", "closed", "fixed", "agreed"]
@@ -583,21 +514,9 @@ def analyze_agenda_resolution(agenda_points: List[str], transcript: str) -> Tupl
         else: unresolved.append(p)
     return resolved, unresolved
 
-# --------------- Quality CSV ------------
-METRICS_CSV = os.path.join(CACHE_DIR, "quality_metrics.csv")
-
-def metrics_csv_init():
-    if not os.path.isfile(METRICS_CSV):
-        with open(METRICS_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow(["ts","meeting_id","ocr_hit_proxy","stt_wer","usefulness"])
-
-def metrics_csv_append(meeting_id: int, ocr_hit_proxy: Optional[float], stt_wer: Optional[float], usefulness: Optional[float]):
-    metrics_csv_init()
-    with open(METRICS_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([datetime.utcnow().isoformat(), meeting_id, ocr_hit_proxy, stt_wer, usefulness])
-
-# --------------- UI STATE ---------------
+# =======================
+# APP STATE
+# =======================
 @dataclass
 class AppState:
     meeting_id: Optional[int] = None
@@ -614,9 +533,11 @@ if "app" not in st.session_state:
     st.session_state.app = AppState()
 app: AppState = st.session_state.app
 
-# ----------------- TABS ------------------
+# =======================
+# TABS
+# =======================
 tab_pre, tab_agenda, tab_track, tab_summary = st.tabs(
-    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary",]
+    ["📄 Pre-Meeting", "📋 Agenda", "🎥 Tracking", "📝 Post-Summary"]
 )
 
 # -------- PRE-MEETING TAB --------
@@ -644,10 +565,9 @@ with tab_pre:
             raw = up.read()
             app.document_id, app.document_hash = document_get_or_create(app.meeting_id, up.name, up.type or "", raw)
 
-            # Extract or reuse text (cached by doc hash)
-            text = None
+            # Extract or reuse text
             conn = db_conn()
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
                 cur.execute("SELECT text FROM documents WHERE id=%s", (app.document_id,))
                 row = cur.fetchone()
             conn.close()
@@ -675,7 +595,7 @@ with tab_pre:
 
             app.last_doc_text = text
 
-            # Build or load indices with settings-hash
+            # Build or load indices
             st.info("Building / loading indices...")
             splitter_conf = {"chunk_size":1400, "overlap":160}
             app.faiss_store, app.bm25, app.chunks, _, _ = build_and_persist_indices(
@@ -745,7 +665,6 @@ with tab_track:
                     tmp_v.write(v.getbuffer())
                     media_path = tmp_v.name
 
-                # Extract audio fast
                 audio_path = extract_audio_to_wav(media_path)
                 safe_unlink(media_path)
 
@@ -818,7 +737,7 @@ with tab_summary:
             else:
                 if not app.last_doc_text:
                     conn = db_conn()
-                    with conn.cursor() as cur:
+                    with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
                         cur.execute("SELECT text FROM documents WHERE meeting_id=%s ORDER BY created_at DESC LIMIT 1", (app.meeting_id,))
                         row = cur.fetchone()
                     conn.close()
@@ -844,24 +763,14 @@ with tab_summary:
                                    mime="application/json",
                                    use_container_width=True)
 
-# -------- METRICS & EXPORT TAB ----------
-
-
 # ======= FINAL NOTE =======
 if not OPENAI_API_KEY:
     st.info("No OPENAI_API_KEY set. Agenda/Summary will use robust fallbacks (JSON heuristic). Embeddings default to MiniLM CPU.")
 
-# === DB INDEX SUGGESTIONS (run once in your DB) ===
+# === Helpful DB indexes (run once) ===
 # CREATE INDEX idx_meetings_title_date ON meetings (title, meeting_date);
 # CREATE UNIQUE INDEX idx_documents_meeting_hash ON documents (meeting_id, hash_key);
 # CREATE INDEX idx_doc_chunks_doc ON doc_chunks (document_id, chunk_index);
 # CREATE INDEX idx_indices_doc ON indices (document_id);
 # CREATE UNIQUE INDEX idx_transcripts_meeting_audio ON transcripts (meeting_id, audio_hash);
 # CREATE INDEX idx_summaries_meeting ON summaries (meeting_id);
-
-
-
-
-
-
-
